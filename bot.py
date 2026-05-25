@@ -11,7 +11,7 @@ GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
 VOICE_NAME = os.environ.get("TTS_VOICE", "th-TH-Chirp3-HD-Achernar")
 LANGUAGE_CODE = VOICE_NAME.rsplit("-Chirp3", 1)[0]
 MAX_CHARS = 20000
-CHUNK_SIZE = 4000
+CHUNK_SIZE = 1500
 MAX_SENTENCE = 250
 PORT = int(os.environ.get("PORT", 8443))
 
