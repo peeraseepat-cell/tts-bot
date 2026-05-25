@@ -1,4 +1,5 @@
 import asyncio
+import io
 import os
 import tempfile
 import unittest
@@ -31,6 +32,16 @@ class OutputPartTests(unittest.TestCase):
         self.assertEqual(bot.TTS_MAX_RETRIES, 0)
         self.assertEqual(bot.TTS_READ_TIMEOUT, 15)
         self.assertEqual(bot.TTS_FILE_TIMEOUT, 30)
+        self.assertEqual(bot.TELEGRAM_SEND_TIMEOUT, 30)
+
+    def test_runtime_status_shows_timeout_config(self):
+        summary = bot.USAGE_METER.preview()
+
+        text = bot._format_runtime_status(summary)
+
+        self.assertIn("part max chunks: 4", text)
+        self.assertIn("TTS file timeout: 30s", text)
+        self.assertIn("Telegram send timeout: 30s", text)
 
 
 class SynthesizeProgressTests(unittest.IsolatedAsyncioTestCase):
@@ -73,6 +84,65 @@ class SynthesizeProgressTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "เกิน 0.01 วิ"):
                 await bot._synthesize_part_with_timeout("ภาษาไทย")
+
+
+class TelegramSendTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_voice_with_timeout_fails_after_telegram_timeout(self):
+        class SlowBot:
+            async def send_voice(self, **_kwargs):
+                await asyncio.sleep(1)
+
+        class FakeApp:
+            bot = SlowBot()
+
+        with mock.patch.object(bot, "TELEGRAM_SEND_TIMEOUT", 0.01):
+            with self.assertRaisesRegex(RuntimeError, "Telegram เกิน 0.01 วิ"):
+                await bot._send_voice_with_timeout(
+                    app=FakeApp(),
+                    chat_id=1,
+                    voice=io.BytesIO(b"audio"),
+                    caption="ไฟล์ 1/1",
+                )
+
+    async def test_process_job_marks_telegram_send_phase(self):
+        class FakeBot:
+            def __init__(self):
+                self.edits = []
+                self.voices = []
+
+            async def edit_message_text(self, chat_id, message_id, text):
+                self.edits.append(text)
+
+            async def send_message(self, chat_id, text):
+                self.edits.append(text)
+
+            async def send_voice(self, chat_id, voice, caption):
+                self.voices.append((voice.getvalue(), caption))
+
+        class FakeApp:
+            def __init__(self):
+                self.bot = FakeBot()
+
+        app = FakeApp()
+
+        async def fake_synthesize_part_with_timeout(_part, progress=None):
+            if progress:
+                await progress(1, 1)
+            return b"audio", 5, 1, bot.USAGE_METER.preview()
+
+        job = bot.TTSJob(
+            chat_id=1,
+            status_message_id=2,
+            text="hello",
+            parts=["hello"],
+            queued_at=datetime.now(ZoneInfo("Asia/Bangkok")),
+        )
+
+        with mock.patch.object(bot, "_synthesize_part_with_timeout", fake_synthesize_part_with_timeout):
+            await bot._process_job(app, job)
+
+        self.assertIn("สร้างเสียงไฟล์ 1/1 เสร็จแล้ว กำลังส่งเข้า Telegram...", app.bot.edits)
+        self.assertEqual(app.bot.voices[0], (b"audio", "ไฟล์ 1/1 · 5 ตัวอักษร"))
 
 
 class UsageMeterTests(unittest.TestCase):

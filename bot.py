@@ -3,6 +3,7 @@ import base64
 import contextlib
 import io
 import json
+import logging
 import math
 import os
 from dataclasses import dataclass, field
@@ -31,7 +32,11 @@ TTS_MAX_RETRIES = int(os.environ.get("TTS_MAX_RETRIES", 0))
 TTS_CONNECT_TIMEOUT = float(os.environ.get("TTS_CONNECT_TIMEOUT", 10))
 TTS_READ_TIMEOUT = float(os.environ.get("TTS_READ_TIMEOUT", 15))
 TTS_FILE_TIMEOUT = float(os.environ.get("TTS_FILE_TIMEOUT", 30))
+TELEGRAM_SEND_TIMEOUT = float(os.environ.get("TELEGRAM_SEND_TIMEOUT", 30))
 PORT = int(os.environ.get("PORT", 8443))
+
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+LOGGER = logging.getLogger(__name__)
 
 TTS_URL = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_API_KEY}"
 SENTENCE_ENDINGS = (".", "!", "?", "。", "…")
@@ -208,6 +213,19 @@ def _format_usage_summary(summary: UsageSummary, used_this_job: int, requests: i
     )
 
 
+def _format_runtime_status(summary: UsageSummary) -> str:
+    return (
+        "TTS bot status\n"
+        f"collect window: {COLLECT_WINDOW_SECONDS:g}s\n"
+        f"part max chunks: {TTS_PART_MAX_CHUNKS}\n"
+        f"TTS read timeout: {TTS_READ_TIMEOUT:g}s\n"
+        f"TTS file timeout: {TTS_FILE_TIMEOUT:g}s\n"
+        f"Telegram send timeout: {TELEGRAM_SEND_TIMEOUT:g}s\n"
+        f"usage: {summary.used:,}/{summary.limit:,} chars\n"
+        f"reset: {summary.reset_at:%Y-%m-%d %H:%M} ({USAGE_TIMEZONE})"
+    )
+
+
 def _get_queue() -> asyncio.Queue:
     global JOB_QUEUE
     if JOB_QUEUE is None:
@@ -287,6 +305,21 @@ async def _synthesize_part_with_timeout(
         raise RuntimeError(f"สร้างเสียงไฟล์นี้เกิน {TTS_FILE_TIMEOUT:g} วิ") from exc
 
 
+async def _send_voice_with_timeout(
+    app: Application,
+    chat_id: int,
+    voice: io.BytesIO,
+    caption: str,
+) -> None:
+    try:
+        await asyncio.wait_for(
+            app.bot.send_voice(chat_id=chat_id, voice=voice, caption=caption),
+            timeout=TELEGRAM_SEND_TIMEOUT,
+        )
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(f"ส่งไฟล์เสียงเข้า Telegram เกิน {TELEGRAM_SEND_TIMEOUT:g} วิ") from exc
+
+
 async def _safe_edit_or_send(app: Application, chat_id: int, message_id: int, text: str) -> None:
     try:
         await app.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
@@ -345,6 +378,14 @@ async def _tts_worker(app: Application) -> None:
         job = await queue.get()
         try:
             await _process_job(app, job)
+        except Exception as exc:
+            LOGGER.exception("Unhandled TTS job failure")
+            await _safe_edit_or_send(
+                app,
+                job.chat_id,
+                job.status_message_id,
+                f"เกิดข้อผิดพลาดในคิว TTS: {exc}",
+            )
         finally:
             queue.task_done()
 
@@ -355,6 +396,7 @@ async def _process_job(app: Application, job: TTSJob) -> None:
     summary = USAGE_METER.preview()
 
     for index, part in enumerate(job.parts, start=1):
+        LOGGER.info("Processing TTS file %s/%s chars=%s", index, len(job.parts), len(part))
         await _safe_edit_or_send(
             app,
             job.chat_id,
@@ -387,11 +429,27 @@ async def _process_job(app: Application, job: TTSJob) -> None:
         total_requests += requests
         voice = io.BytesIO(audio_bytes)
         voice.name = f"tts_part_{index:02d}_of_{len(job.parts):02d}.mp3"
-        await app.bot.send_voice(
-            chat_id=job.chat_id,
-            voice=voice,
-            caption=f"ไฟล์ {index}/{len(job.parts)} · {len(part):,} ตัวอักษร",
+        await _safe_edit_or_send(
+            app,
+            job.chat_id,
+            job.status_message_id,
+            f"สร้างเสียงไฟล์ {index}/{len(job.parts)} เสร็จแล้ว กำลังส่งเข้า Telegram...",
         )
+        try:
+            await _send_voice_with_timeout(
+                app=app,
+                chat_id=job.chat_id,
+                voice=voice,
+                caption=f"ไฟล์ {index}/{len(job.parts)} · {len(part):,} ตัวอักษร",
+            )
+        except Exception as exc:
+            await _safe_edit_or_send(
+                app,
+                job.chat_id,
+                job.status_message_id,
+                f"เกิดข้อผิดพลาดตอนส่งไฟล์ {index}/{len(job.parts)} เข้า Telegram: {exc}",
+            )
+            return
 
     await _safe_edit_or_send(
         app,
@@ -403,6 +461,10 @@ async def _process_job(app: Application, job: TTSJob) -> None:
 
 async def start(update: Update, context):
     await update.message.reply_text("ส่ง text มา แล้วจะแปลงเป็นเสียงให้ฟัง")
+
+
+async def status(update: Update, context):
+    await update.message.reply_text(_format_runtime_status(USAGE_METER.preview()))
 
 
 async def handle_text(update: Update, context):
@@ -437,6 +499,7 @@ async def handle_text(update: Update, context):
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", status))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     webhook_url = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEBHOOK_URL")
