@@ -10,21 +10,45 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
 VOICE_NAME = os.environ.get("TTS_VOICE", "th-TH-Chirp3-HD-Achernar")
 LANGUAGE_CODE = VOICE_NAME.rsplit("-Chirp3", 1)[0]
-MAX_CHARS = 5000
+MAX_CHARS = 20000
+CHUNK_SIZE = 1500
 PORT = int(os.environ.get("PORT", 8443))
 
 TTS_URL = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_API_KEY}"
 
 
+def _split_text(text: str) -> list[str]:
+    if len(text) <= CHUNK_SIZE:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= CHUNK_SIZE:
+            chunks.append(text)
+            break
+        cut = CHUNK_SIZE
+        for sep in ["\n", ". ", "। ", "! ", "? ", ", ", " "]:
+            pos = text.rfind(sep, 0, CHUNK_SIZE)
+            if pos > CHUNK_SIZE // 2:
+                cut = pos + len(sep)
+                break
+        chunks.append(text[:cut])
+        text = text[cut:]
+    return chunks
+
+
 async def _synthesize(text: str) -> bytes:
+    chunks = _split_text(text)
+    parts = []
     async with httpx.AsyncClient() as client:
-        resp = await client.post(TTS_URL, json={
-            "input": {"text": text},
-            "voice": {"languageCode": LANGUAGE_CODE, "name": VOICE_NAME},
-            "audioConfig": {"audioEncoding": "MP3"},
-        }, timeout=60)
-        resp.raise_for_status()
-        return base64.b64decode(resp.json()["audioContent"])
+        for chunk in chunks:
+            resp = await client.post(TTS_URL, json={
+                "input": {"text": chunk},
+                "voice": {"languageCode": LANGUAGE_CODE, "name": VOICE_NAME},
+                "audioConfig": {"audioEncoding": "MP3"},
+            }, timeout=60)
+            resp.raise_for_status()
+            parts.append(base64.b64decode(resp.json()["audioContent"]))
+    return b"".join(parts)
 
 
 async def start(update: Update, context):
@@ -39,7 +63,9 @@ async def handle_text(update: Update, context):
         await update.message.reply_text(f"ข้อความยาวเกิน {MAX_CHARS} ตัวอักษร")
         return
 
-    msg = await update.message.reply_text("กำลังสร้างเสียง...")
+    n_chunks = len(_split_text(text))
+    status = "กำลังสร้างเสียง..." if n_chunks == 1 else f"กำลังสร้างเสียง ({n_chunks} ท่อน)..."
+    msg = await update.message.reply_text(status)
 
     try:
         audio_bytes = await _synthesize(text)
