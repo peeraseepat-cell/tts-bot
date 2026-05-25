@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import os
@@ -11,52 +12,47 @@ GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
 VOICE_NAME = os.environ.get("TTS_VOICE", "th-TH-Chirp3-HD-Achernar")
 LANGUAGE_CODE = VOICE_NAME.rsplit("-Chirp3", 1)[0]
 MAX_CHARS = 20000
-CHUNK_SIZE = 1500
-MAX_SENTENCE = 250
+CHUNK_SIZE = 220
 PORT = int(os.environ.get("PORT", 8443))
 
 TTS_URL = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_API_KEY}"
+SENTENCE_ENDINGS = (".", "!", "?", "。", "…")
+SOFT_ENDINGS = ",;:，；："
 
 
-def _break_long_sentences(text: str) -> str:
-    result = []
-    since_punct = 0
-    for char in text:
-        result.append(char)
-        since_punct += 1
-        if char in ".!?\n":
-            since_punct = 0
-        elif since_punct >= MAX_SENTENCE and char == " ":
-            result.append(".")
-            since_punct = 0
-    return "".join(result)
+def _ensure_sentence_ending(chunk: str) -> str:
+    chunk = chunk.strip()
+    if not chunk or chunk.endswith(SENTENCE_ENDINGS):
+        return chunk
+    return chunk.rstrip(SOFT_ENDINGS) + "."
 
 
 def _split_text(text: str) -> list[str]:
-    text = _break_long_sentences(text)
+    text = text.strip()
     if len(text) <= CHUNK_SIZE:
-        return [text]
+        return [_ensure_sentence_ending(text)]
     chunks = []
     while text:
         if len(text) <= CHUNK_SIZE:
-            chunks.append(text)
+            chunks.append(_ensure_sentence_ending(text))
             break
         cut = CHUNK_SIZE
-        for sep in ["\n", ". ", "! ", "? ", ", ", " "]:
+        for sep in ["\n", ". ", "! ", "? ", "。", "…", ", ", " "]:
             pos = text.rfind(sep, 0, CHUNK_SIZE)
             if pos > CHUNK_SIZE // 2:
                 cut = pos + len(sep)
                 break
-        chunks.append(text[:cut])
-        text = text[cut:]
+        chunks.append(_ensure_sentence_ending(text[:cut]))
+        text = text[cut:].lstrip()
     return chunks
 
 
 async def _synthesize(text: str) -> bytes:
     chunks = _split_text(text)
-    parts = []
-    async with httpx.AsyncClient() as client:
-        for chunk in chunks:
+    sem = asyncio.Semaphore(3)
+
+    async def _call(client: httpx.AsyncClient, chunk: str) -> bytes:
+        async with sem:
             resp = await client.post(TTS_URL, json={
                 "input": {"text": chunk},
                 "voice": {"languageCode": LANGUAGE_CODE, "name": VOICE_NAME},
@@ -65,7 +61,10 @@ async def _synthesize(text: str) -> bytes:
             if resp.status_code != 200:
                 err = resp.json().get("error", {}).get("message", resp.text[:200])
                 raise RuntimeError(f"Google TTS: {err}")
-            parts.append(base64.b64decode(resp.json()["audioContent"]))
+            return base64.b64decode(resp.json()["audioContent"])
+
+    async with httpx.AsyncClient() as client:
+        parts = await asyncio.gather(*[_call(client, c) for c in chunks])
     return b"".join(parts)
 
 
