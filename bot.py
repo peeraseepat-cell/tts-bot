@@ -8,7 +8,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+from typing import Awaitable, Callable, Optional, Union
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -22,13 +22,13 @@ LANGUAGE_CODE = VOICE_NAME.rsplit("-Chirp3", 1)[0]
 MAX_CHARS = 20000
 CHUNK_SIZE = 220
 PART_SIZE = int(os.environ.get("TTS_PART_SIZE", 2500))
-COLLECT_WINDOW_SECONDS = float(os.environ.get("COLLECT_WINDOW_SECONDS", 10))
+COLLECT_WINDOW_SECONDS = float(os.environ.get("COLLECT_WINDOW_SECONDS", 5))
 MONTHLY_FREE_CHARS = int(os.environ.get("TTS_MONTHLY_FREE_CHARS", 1_000_000))
 USAGE_FILE = Path(os.environ.get("TTS_USAGE_FILE", "usage.json"))
 USAGE_TIMEZONE = os.environ.get("TTS_USAGE_TIMEZONE", "Asia/Bangkok")
-TTS_MAX_RETRIES = int(os.environ.get("TTS_MAX_RETRIES", 2))
+TTS_MAX_RETRIES = int(os.environ.get("TTS_MAX_RETRIES", 1))
 TTS_CONNECT_TIMEOUT = float(os.environ.get("TTS_CONNECT_TIMEOUT", 10))
-TTS_READ_TIMEOUT = float(os.environ.get("TTS_READ_TIMEOUT", 120))
+TTS_READ_TIMEOUT = float(os.environ.get("TTS_READ_TIMEOUT", 25))
 PORT = int(os.environ.get("PORT", 8443))
 
 TTS_URL = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_API_KEY}"
@@ -246,14 +246,19 @@ async def _post_tts_chunk(client: httpx.AsyncClient, chunk: str) -> bytes:
     raise RuntimeError("Google TTS failed")
 
 
-async def _synthesize_part(text: str) -> tuple[bytes, int, int, UsageSummary]:
+async def _synthesize_part(
+    text: str,
+    progress: Optional[Callable[[int, int], Awaitable[None]]] = None,
+) -> tuple[bytes, int, int, UsageSummary]:
     chunks = _split_text(text)
     timeout = httpx.Timeout(TTS_READ_TIMEOUT, connect=TTS_CONNECT_TIMEOUT)
     audio_parts = []
     used_chars = 0
     summary = USAGE_METER.preview()
     async with httpx.AsyncClient(timeout=timeout) as client:
-        for chunk in chunks:
+        for index, chunk in enumerate(chunks, start=1):
+            if progress:
+                await progress(index, len(chunks))
             audio_parts.append(await _post_tts_chunk(client, chunk))
             used_chars += len(chunk)
             summary = USAGE_METER.record(len(chunk))
@@ -340,7 +345,18 @@ async def _process_job(app: Application, job: TTSJob) -> None:
             f"กำลังสร้างเสียงไฟล์ {index}/{len(job.parts)}...",
         )
         try:
-            audio_bytes, used_chars, requests, summary = await _synthesize_part(part)
+            async def report_progress(done: int, total: int) -> None:
+                await _safe_edit_or_send(
+                    app,
+                    job.chat_id,
+                    job.status_message_id,
+                    f"กำลังสร้างเสียงไฟล์ {index}/{len(job.parts)} · ท่อน {done}/{total}...",
+                )
+
+            audio_bytes, used_chars, requests, summary = await _synthesize_part(
+                part,
+                progress=report_progress,
+            )
         except Exception as exc:
             await _safe_edit_or_send(
                 app,
