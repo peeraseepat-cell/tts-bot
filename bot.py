@@ -11,13 +11,29 @@ GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
 VOICE_NAME = os.environ.get("TTS_VOICE", "th-TH-Chirp3-HD-Achernar")
 LANGUAGE_CODE = VOICE_NAME.rsplit("-Chirp3", 1)[0]
 MAX_CHARS = 20000
-CHUNK_SIZE = 500
+CHUNK_SIZE = 4000
+MAX_SENTENCE = 250
 PORT = int(os.environ.get("PORT", 8443))
 
 TTS_URL = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_API_KEY}"
 
 
+def _break_long_sentences(text: str) -> str:
+    result = []
+    since_punct = 0
+    for char in text:
+        result.append(char)
+        since_punct += 1
+        if char in ".!?\n":
+            since_punct = 0
+        elif since_punct >= MAX_SENTENCE and char == " ":
+            result.append(".")
+            since_punct = 0
+    return "".join(result)
+
+
 def _split_text(text: str) -> list[str]:
+    text = _break_long_sentences(text)
     if len(text) <= CHUNK_SIZE:
         return [text]
     chunks = []
@@ -26,7 +42,7 @@ def _split_text(text: str) -> list[str]:
             chunks.append(text)
             break
         cut = CHUNK_SIZE
-        for sep in ["\n", ". ", "। ", "! ", "? ", ", ", " "]:
+        for sep in ["\n", ". ", "! ", "? ", ", ", " "]:
             pos = text.rfind(sep, 0, CHUNK_SIZE)
             if pos > CHUNK_SIZE // 2:
                 cut = pos + len(sep)
