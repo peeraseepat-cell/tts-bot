@@ -90,7 +90,7 @@ class TelegramSendTests(unittest.IsolatedAsyncioTestCase):
     async def test_send_voice_with_timeout_fails_after_telegram_timeout(self):
         class SlowBot:
             async def send_voice(self, **_kwargs):
-                await asyncio.sleep(1)
+                await asyncio.sleep(10)
 
         class FakeApp:
             bot = SlowBot()
@@ -116,7 +116,7 @@ class TelegramSendTests(unittest.IsolatedAsyncioTestCase):
             async def send_message(self, chat_id, text):
                 self.edits.append(text)
 
-            async def send_voice(self, chat_id, voice, caption):
+            async def send_voice(self, chat_id, voice, caption, **_kwargs):
                 self.voices.append((voice.getvalue(), caption))
 
         class FakeApp:
@@ -140,6 +140,7 @@ class TelegramSendTests(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(bot, "_synthesize_part_with_timeout", fake_synthesize_part_with_timeout):
             await bot._process_job(app, job)
+            await asyncio.sleep(0.05)
 
         self.assertIn("สร้างเสียงไฟล์ 1/1 เสร็จแล้ว กำลังส่งเข้า Telegram...", app.bot.edits)
         self.assertEqual(app.bot.voices[0], (b"audio", "ไฟล์ 1/1 · 5 ตัวอักษร"))

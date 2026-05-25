@@ -1,11 +1,13 @@
 import asyncio
 import base64
 import contextlib
+import hashlib
 import io
 import json
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -240,7 +242,10 @@ def _ensure_worker(app: Application) -> None:
 
 
 async def _post_tts_chunk(client: httpx.AsyncClient, chunk: str) -> bytes:
+    chunk_hash = hashlib.sha1(chunk.encode()).hexdigest()[:8]
+    chunk_bytes = len(chunk.encode("utf-8"))
     for attempt in range(TTS_MAX_RETRIES + 1):
+        start = time.monotonic()
         try:
             resp = await client.post(TTS_URL, json={
                 "input": {"text": chunk},
@@ -248,18 +253,23 @@ async def _post_tts_chunk(client: httpx.AsyncClient, chunk: str) -> bytes:
                 "audioConfig": {"audioEncoding": "MP3"},
             })
         except (httpx.TimeoutException, httpx.TransportError) as exc:
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            LOGGER.warning("TTS chunk hash=%s bytes=%d timeout after %dms", chunk_hash, chunk_bytes, elapsed_ms)
             if attempt >= TTS_MAX_RETRIES:
                 raise RuntimeError(f"Google TTS timed out after {attempt + 1} attempts") from exc
             await asyncio.sleep(2 * (attempt + 1))
             continue
 
+        elapsed_ms = int((time.monotonic() - start) * 1000)
         if resp.status_code == 200:
+            LOGGER.info("TTS chunk hash=%s bytes=%d status=200 elapsed=%dms", chunk_hash, chunk_bytes, elapsed_ms)
             return base64.b64decode(resp.json()["audioContent"])
 
         try:
             err = resp.json().get("error", {}).get("message", resp.text[:200])
         except ValueError:
             err = resp.text[:200]
+        LOGGER.warning("TTS chunk hash=%s bytes=%d status=%d elapsed=%dms err=%s", chunk_hash, chunk_bytes, resp.status_code, elapsed_ms, err[:100])
         if resp.status_code in {429, 500, 502, 503, 504} and attempt < TTS_MAX_RETRIES:
             await asyncio.sleep(2 * (attempt + 1))
             continue
@@ -313,8 +323,15 @@ async def _send_voice_with_timeout(
 ) -> None:
     try:
         await asyncio.wait_for(
-            app.bot.send_voice(chat_id=chat_id, voice=voice, caption=caption),
-            timeout=TELEGRAM_SEND_TIMEOUT,
+            app.bot.send_voice(
+                chat_id=chat_id,
+                voice=voice,
+                caption=caption,
+                read_timeout=TELEGRAM_SEND_TIMEOUT,
+                write_timeout=TELEGRAM_SEND_TIMEOUT,
+                connect_timeout=10,
+            ),
+            timeout=TELEGRAM_SEND_TIMEOUT + 5,
         )
     except asyncio.TimeoutError as exc:
         raise RuntimeError(f"ส่งไฟล์เสียงเข้า Telegram เกิน {TELEGRAM_SEND_TIMEOUT:g} วิ") from exc
@@ -326,6 +343,10 @@ async def _safe_edit_or_send(app: Application, chat_id: int, message_id: int, te
     except Exception:
         with contextlib.suppress(Exception):
             await app.bot.send_message(chat_id=chat_id, text=text)
+
+
+def _fire_and_forget_edit(app: Application, chat_id: int, message_id: int, text: str) -> None:
+    asyncio.create_task(_safe_edit_or_send(app, chat_id, message_id, text))
 
 
 async def _flush_chat_after_delay(chat_id: int, app: Application) -> None:
@@ -405,7 +426,7 @@ async def _process_job(app: Application, job: TTSJob) -> None:
         )
         try:
             async def report_progress(done: int, total: int) -> None:
-                await _safe_edit_or_send(
+                _fire_and_forget_edit(
                     app,
                     job.chat_id,
                     job.status_message_id,
@@ -429,20 +450,26 @@ async def _process_job(app: Application, job: TTSJob) -> None:
         total_requests += requests
         voice = io.BytesIO(audio_bytes)
         voice.name = f"tts_part_{index:02d}_of_{len(job.parts):02d}.mp3"
-        await _safe_edit_or_send(
+        voice_size = len(audio_bytes)
+        _fire_and_forget_edit(
             app,
             job.chat_id,
             job.status_message_id,
             f"สร้างเสียงไฟล์ {index}/{len(job.parts)} เสร็จแล้ว กำลังส่งเข้า Telegram...",
         )
         try:
+            send_start = time.monotonic()
             await _send_voice_with_timeout(
                 app=app,
                 chat_id=job.chat_id,
                 voice=voice,
                 caption=f"ไฟล์ {index}/{len(job.parts)} · {len(part):,} ตัวอักษร",
             )
+            send_ms = int((time.monotonic() - send_start) * 1000)
+            LOGGER.info("Sent voice file %s/%s size=%d elapsed=%dms", index, len(job.parts), voice_size, send_ms)
         except Exception as exc:
+            send_ms = int((time.monotonic() - send_start) * 1000)
+            LOGGER.error("Failed voice file %s/%s size=%d elapsed=%dms err=%s", index, len(job.parts), voice_size, send_ms, exc)
             await _safe_edit_or_send(
                 app,
                 job.chat_id,
