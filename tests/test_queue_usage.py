@@ -20,13 +20,15 @@ class OutputPartTests(unittest.TestCase):
         self.assertGreater(len(parts), 1)
         self.assertLessEqual(max(len(part) for part in parts), bot.PART_SIZE + 1)
         self.assertTrue(all(part.endswith(bot.SENTENCE_ENDINGS) for part in parts))
+        self.assertTrue(all(len(bot._split_text(part)) <= bot.TTS_PART_MAX_CHUNKS for part in parts))
 
     def test_collect_window_default_is_five_seconds(self):
         self.assertEqual(bot.COLLECT_WINDOW_SECONDS, 5)
 
     def test_tts_timeout_defaults_fail_fast_enough_for_telegram(self):
-        self.assertEqual(bot.TTS_MAX_RETRIES, 1)
-        self.assertEqual(bot.TTS_READ_TIMEOUT, 25)
+        self.assertEqual(bot.TTS_PART_MAX_CHUNKS, 4)
+        self.assertEqual(bot.TTS_MAX_RETRIES, 0)
+        self.assertEqual(bot.TTS_READ_TIMEOUT, 15)
 
 
 class SynthesizeProgressTests(unittest.IsolatedAsyncioTestCase):

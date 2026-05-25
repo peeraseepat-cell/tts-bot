@@ -22,13 +22,14 @@ LANGUAGE_CODE = VOICE_NAME.rsplit("-Chirp3", 1)[0]
 MAX_CHARS = 20000
 CHUNK_SIZE = 220
 PART_SIZE = int(os.environ.get("TTS_PART_SIZE", 2500))
+TTS_PART_MAX_CHUNKS = int(os.environ.get("TTS_PART_MAX_CHUNKS", 4))
 COLLECT_WINDOW_SECONDS = float(os.environ.get("COLLECT_WINDOW_SECONDS", 5))
 MONTHLY_FREE_CHARS = int(os.environ.get("TTS_MONTHLY_FREE_CHARS", 1_000_000))
 USAGE_FILE = Path(os.environ.get("TTS_USAGE_FILE", "usage.json"))
 USAGE_TIMEZONE = os.environ.get("TTS_USAGE_TIMEZONE", "Asia/Bangkok")
-TTS_MAX_RETRIES = int(os.environ.get("TTS_MAX_RETRIES", 1))
+TTS_MAX_RETRIES = int(os.environ.get("TTS_MAX_RETRIES", 0))
 TTS_CONNECT_TIMEOUT = float(os.environ.get("TTS_CONNECT_TIMEOUT", 10))
-TTS_READ_TIMEOUT = float(os.environ.get("TTS_READ_TIMEOUT", 25))
+TTS_READ_TIMEOUT = float(os.environ.get("TTS_READ_TIMEOUT", 15))
 PORT = int(os.environ.get("PORT", 8443))
 
 TTS_URL = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_API_KEY}"
@@ -153,16 +154,17 @@ def _ensure_sentence_ending(chunk: str) -> str:
 
 def _split_text(text: str) -> list[str]:
     text = text.strip()
-    if len(text) <= CHUNK_SIZE:
+    if len(text) <= CHUNK_SIZE + 1:
         return [_ensure_sentence_ending(text)]
     chunks = []
     while text:
-        if len(text) <= CHUNK_SIZE:
+        if len(text) <= CHUNK_SIZE + 1:
             chunks.append(_ensure_sentence_ending(text))
             break
         cut = CHUNK_SIZE
-        for sep in ["\n", ". ", "! ", "? ", "。", "…", ", ", " "]:
-            pos = text.rfind(sep, 0, CHUNK_SIZE)
+        search_limit = CHUNK_SIZE + 1
+        for sep in ["\n", ". ", "! ", "? ", "。", "…", ".", "!", "?", ", ", " "]:
+            pos = text.rfind(sep, 0, search_limit)
             if pos > CHUNK_SIZE // 2:
                 cut = pos + len(sep)
                 break
@@ -172,22 +174,23 @@ def _split_text(text: str) -> list[str]:
 
 
 def _split_output_parts(text: str) -> list[str]:
-    text = text.strip()
-    if len(text) <= PART_SIZE:
+    chunks = _split_text(text)
+    if len(chunks) <= TTS_PART_MAX_CHUNKS and len(text.strip()) <= PART_SIZE:
         return [_ensure_sentence_ending(text)]
+
     parts = []
-    while text:
-        if len(text) <= PART_SIZE:
-            parts.append(_ensure_sentence_ending(text))
-            break
-        cut = PART_SIZE
-        for sep in ["\n", ". ", "! ", "? ", "。", "…", ", ", " "]:
-            pos = text.rfind(sep, 0, PART_SIZE)
-            if pos > PART_SIZE // 2:
-                cut = pos + len(sep)
-                break
-        parts.append(_ensure_sentence_ending(text[:cut]))
-        text = text[cut:].lstrip()
+    current = []
+    current_len = 0
+    for chunk in chunks:
+        next_len = current_len + len(chunk)
+        if current and (len(current) >= TTS_PART_MAX_CHUNKS or next_len > PART_SIZE):
+            parts.append(_ensure_sentence_ending("".join(current)))
+            current = []
+            current_len = 0
+        current.append(chunk)
+        current_len += len(chunk)
+    if current:
+        parts.append(_ensure_sentence_ending("".join(current)))
     return parts
 
 
