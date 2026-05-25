@@ -30,6 +30,7 @@ USAGE_TIMEZONE = os.environ.get("TTS_USAGE_TIMEZONE", "Asia/Bangkok")
 TTS_MAX_RETRIES = int(os.environ.get("TTS_MAX_RETRIES", 0))
 TTS_CONNECT_TIMEOUT = float(os.environ.get("TTS_CONNECT_TIMEOUT", 10))
 TTS_READ_TIMEOUT = float(os.environ.get("TTS_READ_TIMEOUT", 15))
+TTS_FILE_TIMEOUT = float(os.environ.get("TTS_FILE_TIMEOUT", 30))
 PORT = int(os.environ.get("PORT", 8443))
 
 TTS_URL = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_API_KEY}"
@@ -273,6 +274,19 @@ async def _synthesize(text: str) -> bytes:
     return audio_bytes
 
 
+async def _synthesize_part_with_timeout(
+    text: str,
+    progress: Optional[Callable[[int, int], Awaitable[None]]] = None,
+) -> tuple[bytes, int, int, UsageSummary]:
+    try:
+        return await asyncio.wait_for(
+            _synthesize_part(text, progress=progress),
+            timeout=TTS_FILE_TIMEOUT,
+        )
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(f"สร้างเสียงไฟล์นี้เกิน {TTS_FILE_TIMEOUT:g} วิ") from exc
+
+
 async def _safe_edit_or_send(app: Application, chat_id: int, message_id: int, text: str) -> None:
     try:
         await app.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
@@ -356,7 +370,7 @@ async def _process_job(app: Application, job: TTSJob) -> None:
                     f"กำลังสร้างเสียงไฟล์ {index}/{len(job.parts)} · ท่อน {done}/{total}...",
                 )
 
-            audio_bytes, used_chars, requests, summary = await _synthesize_part(
+            audio_bytes, used_chars, requests, summary = await _synthesize_part_with_timeout(
                 part,
                 progress=report_progress,
             )

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import unittest
@@ -29,6 +30,7 @@ class OutputPartTests(unittest.TestCase):
         self.assertEqual(bot.TTS_PART_MAX_CHUNKS, 4)
         self.assertEqual(bot.TTS_MAX_RETRIES, 0)
         self.assertEqual(bot.TTS_READ_TIMEOUT, 15)
+        self.assertEqual(bot.TTS_FILE_TIMEOUT, 30)
 
 
 class SynthesizeProgressTests(unittest.IsolatedAsyncioTestCase):
@@ -60,6 +62,17 @@ class SynthesizeProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(progress[-1], (requests, requests))
         self.assertGreater(len(audio), 0)
         self.assertEqual(used_chars, sum(len(chunk) for chunk in bot._split_text("ภาษาไทยไม่มีเว้นวรรค" * 40)))
+
+    async def test_synthesize_part_with_timeout_fails_after_file_timeout(self):
+        async def slow_synthesize_part(_text, progress=None):
+            await asyncio.sleep(1)
+            return b"", 0, 0, bot.USAGE_METER.preview()
+
+        with mock.patch.object(bot, "TTS_FILE_TIMEOUT", 0.01), mock.patch.object(
+            bot, "_synthesize_part", slow_synthesize_part
+        ):
+            with self.assertRaisesRegex(RuntimeError, "เกิน 0.01 วิ"):
+                await bot._synthesize_part_with_timeout("ภาษาไทย")
 
 
 class UsageMeterTests(unittest.TestCase):
