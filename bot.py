@@ -11,7 +11,7 @@ GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
 VOICE_NAME = os.environ.get("TTS_VOICE", "th-TH-Chirp3-HD-Achernar")
 LANGUAGE_CODE = VOICE_NAME.rsplit("-Chirp3", 1)[0]
 MAX_CHARS = 20000
-CHUNK_SIZE = 1500
+CHUNK_SIZE = 500
 PORT = int(os.environ.get("PORT", 8443))
 
 TTS_URL = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_API_KEY}"
@@ -46,7 +46,9 @@ async def _synthesize(text: str) -> bytes:
                 "voice": {"languageCode": LANGUAGE_CODE, "name": VOICE_NAME},
                 "audioConfig": {"audioEncoding": "MP3"},
             }, timeout=60)
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                err = resp.json().get("error", {}).get("message", resp.text[:200])
+                raise RuntimeError(f"Google TTS: {err}")
             parts.append(base64.b64decode(resp.json()["audioContent"]))
     return b"".join(parts)
 
