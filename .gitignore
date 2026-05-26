@@ -3,4 +3,3 @@ __pycache__/
 .env
 venv/
 *.mp3
-usage.json

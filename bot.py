@@ -3,20 +3,23 @@ import base64
 import contextlib
 import hashlib
 import io
-import json
 import logging
 import math
 import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
-from typing import Awaitable, Callable, Optional, Union
+from typing import Any, Awaitable, Callable, Optional
 from zoneinfo import ZoneInfo
 
 import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
+
+try:
+    from supabase import create_client
+except ImportError:
+    create_client = None
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
@@ -28,7 +31,8 @@ PART_SIZE = int(os.environ.get("TTS_PART_SIZE", 1950))
 TTS_PART_MAX_CHUNKS = int(os.environ.get("TTS_PART_MAX_CHUNKS", 12))
 COLLECT_WINDOW_SECONDS = float(os.environ.get("COLLECT_WINDOW_SECONDS", 5))
 MONTHLY_FREE_CHARS = int(os.environ.get("TTS_MONTHLY_FREE_CHARS", 1_000_000))
-USAGE_FILE = Path(os.environ.get("TTS_USAGE_FILE", "usage.json"))
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 USAGE_TIMEZONE = os.environ.get("TTS_USAGE_TIMEZONE", "Asia/Bangkok")
 TTS_MAX_RETRIES = int(os.environ.get("TTS_MAX_RETRIES", 0))
 TTS_CONNECT_TIMEOUT = float(os.environ.get("TTS_CONNECT_TIMEOUT", 10))
@@ -72,13 +76,41 @@ class TTSJob:
 
 
 class UsageMeter:
-    def __init__(self, path: Union[str, Path], limit: int, timezone_name: str) -> None:
-        self.path = Path(path)
+    def __init__(
+        self,
+        limit: int,
+        timezone_name: str,
+        client: Optional[Any] = None,
+        table_name: str = "tts_usage",
+    ) -> None:
         self.limit = limit
         self.timezone = ZoneInfo(timezone_name)
+        self.table_name = table_name
+        self.client = client if client is not None else self._create_supabase_client()
+        self._fallback_used_by_period: dict[str, int] = {}
+        self._warned: set[str] = set()
 
     def _now(self) -> datetime:
         return datetime.now(self.timezone)
+
+    def _create_supabase_client(self) -> Optional[Any]:
+        if create_client is None:
+            LOGGER.warning("Supabase usage disabled: supabase package is not installed")
+            return None
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            LOGGER.warning("Supabase usage disabled: SUPABASE_URL or SUPABASE_KEY is not configured")
+            return None
+        try:
+            return create_client(SUPABASE_URL, SUPABASE_KEY)
+        except Exception as exc:
+            LOGGER.warning("Supabase usage disabled: failed to initialize client: %s", exc)
+            return None
+
+    def _warn_once(self, key: str, message: str, exc: Exception) -> None:
+        if key in self._warned:
+            return
+        self._warned.add(key)
+        LOGGER.warning("%s: %s", message, exc)
 
     def _local(self, now: datetime) -> datetime:
         if now.tzinfo is None:
@@ -97,29 +129,46 @@ class UsageMeter:
 
     def _read(self, now: datetime) -> dict:
         period = self._period(now)
-        if not self.path.exists():
-            return {"period": period, "used": 0}
+        if self.client is None:
+            return {"period": period, "used": self._fallback_used_by_period.get(period, 0)}
         try:
-            data = json.loads(self.path.read_text())
-        except (OSError, json.JSONDecodeError):
-            return {"period": period, "used": 0}
-        if data.get("period") != period:
-            return {"period": period, "used": 0}
+            response = (
+                self.client.table(self.table_name)
+                .select("period,used,limit,updated_at")
+                .eq("period", period)
+                .limit(1)
+                .execute()
+            )
+        except Exception as exc:
+            self._warn_once("read", "Supabase usage read failed; using in-memory fallback", exc)
+            return {"period": period, "used": self._fallback_used_by_period.get(period, 0)}
+
+        rows = response.data or []
+        if not rows:
+            return {"period": period, "used": self._fallback_used_by_period.get(period, 0)}
         try:
-            used = max(int(data.get("used", 0)), 0)
+            used = max(int(rows[0].get("used", 0)), 0)
         except (TypeError, ValueError):
             used = 0
         return {"period": period, "used": used}
 
-    def _write(self, data: dict, now: datetime) -> None:
-        data = {
+    def _write(self, data: dict, now: datetime) -> bool:
+        period = data["period"]
+        self._fallback_used_by_period[period] = int(data["used"])
+        if self.client is None:
+            return False
+        row = {
             "period": data["period"],
             "used": int(data["used"]),
             "limit": self.limit,
             "updated_at": self._local(now).isoformat(),
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        try:
+            self.client.table(self.table_name).upsert(row, on_conflict="period").execute()
+        except Exception as exc:
+            self._warn_once("write", "Supabase usage write failed; using in-memory fallback", exc)
+            return False
+        return True
 
     def _summary(self, data: dict, now: datetime) -> UsageSummary:
         reset_at = self._reset_at(now)
@@ -147,7 +196,7 @@ class UsageMeter:
         return self._summary(self._read(current_time), current_time)
 
 
-USAGE_METER = UsageMeter(USAGE_FILE, MONTHLY_FREE_CHARS, USAGE_TIMEZONE)
+USAGE_METER = UsageMeter(MONTHLY_FREE_CHARS, USAGE_TIMEZONE)
 PENDING_BUFFERS: dict[int, PendingChatBuffer] = {}
 JOB_QUEUE: Optional[asyncio.Queue] = None
 WORKER_TASK: Optional[asyncio.Task] = None
