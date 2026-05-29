@@ -83,12 +83,12 @@ class OutputPartTests(unittest.TestCase):
     def test_collect_window_default_is_five_seconds(self):
         self.assertEqual(bot.COLLECT_WINDOW_SECONDS, 5)
 
-    def test_tts_timeout_defaults_fail_fast_enough_for_telegram(self):
+    def test_tts_timeout_defaults_support_long_voice_uploads(self):
         self.assertEqual(bot.TTS_PART_MAX_CHUNKS, 12)
         self.assertEqual(bot.TTS_MAX_RETRIES, 0)
         self.assertEqual(bot.TTS_READ_TIMEOUT, 15)
         self.assertEqual(bot.TTS_FILE_TIMEOUT, 60)
-        self.assertEqual(bot.TELEGRAM_SEND_TIMEOUT, 30)
+        self.assertEqual(bot.TELEGRAM_SEND_TIMEOUT, 90)
 
     def test_runtime_status_shows_timeout_config(self):
         summary = bot.USAGE_METER.preview()
@@ -97,7 +97,7 @@ class OutputPartTests(unittest.TestCase):
 
         self.assertIn("part max chunks: 12", text)
         self.assertIn("TTS file timeout: 60s", text)
-        self.assertIn("Telegram send timeout: 30s", text)
+        self.assertIn("Telegram send timeout: 90s", text)
 
 
 class SynthesizeProgressTests(unittest.IsolatedAsyncioTestCase):

@@ -38,7 +38,7 @@ TTS_MAX_RETRIES = int(os.environ.get("TTS_MAX_RETRIES", 0))
 TTS_CONNECT_TIMEOUT = float(os.environ.get("TTS_CONNECT_TIMEOUT", 10))
 TTS_READ_TIMEOUT = float(os.environ.get("TTS_READ_TIMEOUT", 15))
 TTS_FILE_TIMEOUT = float(os.environ.get("TTS_FILE_TIMEOUT", 60))
-TELEGRAM_SEND_TIMEOUT = float(os.environ.get("TELEGRAM_SEND_TIMEOUT", 30))
+TELEGRAM_SEND_TIMEOUT = float(os.environ.get("TELEGRAM_SEND_TIMEOUT", 90))
 PORT = int(os.environ.get("PORT", 8443))
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
