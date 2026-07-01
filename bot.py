@@ -41,6 +41,13 @@ TTS_FILE_TIMEOUT = float(os.environ.get("TTS_FILE_TIMEOUT", 60))
 TELEGRAM_SEND_TIMEOUT = float(os.environ.get("TELEGRAM_SEND_TIMEOUT", 90))
 PORT = int(os.environ.get("PORT", 8443))
 
+
+def _parse_allowed_chat_ids(raw: str) -> frozenset[int]:
+    return frozenset(int(part) for part in raw.replace(",", " ").split())
+
+
+ALLOWED_CHAT_IDS = _parse_allowed_chat_ids(os.environ.get("ALLOWED_CHAT_IDS", ""))
+
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 LOGGER = logging.getLogger(__name__)
 
@@ -535,20 +542,35 @@ async def _process_job(app: Application, job: TTSJob) -> None:
     )
 
 
+def _is_allowed_chat(chat_id: int) -> bool:
+    if not ALLOWED_CHAT_IDS:
+        return True
+    if chat_id in ALLOWED_CHAT_IDS:
+        return True
+    LOGGER.info("Ignored unauthorized chat_id=%s", chat_id)
+    return False
+
+
 async def start(update: Update, context):
+    if not _is_allowed_chat(update.effective_chat.id):
+        return
     await update.message.reply_text("ส่ง text มา แล้วจะแปลงเป็นเสียงให้ฟัง")
 
 
 async def status(update: Update, context):
+    if not _is_allowed_chat(update.effective_chat.id):
+        return
     await update.message.reply_text(_format_runtime_status(USAGE_METER.preview()))
 
 
 async def handle_text(update: Update, context):
+    chat_id = update.effective_chat.id
+    if not _is_allowed_chat(chat_id):
+        return
+
     text = update.message.text.strip()
     if not text:
         return
-
-    chat_id = update.effective_chat.id
     pending = PENDING_BUFFERS.get(chat_id)
     if pending is None:
         msg = await update.message.reply_text(

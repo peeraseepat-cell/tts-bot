@@ -18,7 +18,8 @@ A small, production-minded Telegram bot that turns Thai text into high-quality a
 - **Handles long text** — up to 20,000 characters per request, auto-split into multiple audio files on sentence boundaries (falls back to soft punctuation, then hard cuts).
 - **Smart message batching** — collects rapid-fire messages within a short window and narrates them as one job, so multi-paragraph pastes stay together.
 - **Job queue with live progress** — every request is queued; the bot reports its queue position and updates `file x/y · chunk m/n` as it works.
-- **Monthly usage metering** — per-user character quota tracking (optional Supabase backend), with a `/status` command and per-job usage summary.
+- **Monthly usage metering** — bot-wide character quota tracking (optional Supabase backend), with a `/status` command and per-job usage summary.
+- **Access control** — optional `ALLOWED_CHAT_IDS` allowlist; unknown chats are silently ignored so strangers can't spend your TTS quota.
 - **Resilient by design** — explicit connect/read/send timeouts, graceful error messages per file, no silent failures.
 - **Deploy anywhere** — single `Dockerfile`, configured entirely through environment variables.
 
@@ -70,6 +71,7 @@ All configuration is via environment variables. Only the first two are required.
 |----------|:--------:|---------|-------------|
 | `TELEGRAM_BOT_TOKEN` | ✅ | — | Bot token from [@BotFather](https://t.me/BotFather) |
 | `GOOGLE_API_KEY` | ✅ | — | Google Cloud API key with Text-to-Speech enabled |
+| `ALLOWED_CHAT_IDS` | | — (everyone) | Comma-separated chat IDs allowed to use the bot; others are silently ignored. Get yours from [@userinfobot](https://t.me/userinfobot) |
 | `TTS_VOICE` | | `th-TH-Chirp3-HD-Achernar` | Any Google Cloud TTS voice name |
 | `SUPABASE_URL` / `SUPABASE_KEY` | | — | Enables persistent per-user usage metering |
 | `TTS_MONTHLY_FREE_CHARS` | | `1000000` | Monthly character quota per user |
