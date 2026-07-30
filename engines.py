@@ -22,6 +22,8 @@ from typing import Optional, Protocol
 
 import httpx
 
+import audio_format
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -49,6 +51,16 @@ class VoiceSpec:
 
 
 class TTSEngine(Protocol):
+    """สัญญาของ engine ทุกตัว
+
+    `-> bytes` เป็นสัญญาที่ว่างเปล่า — bytes อะไรก็ผ่าน type checker ได้หมด
+    (บทเรียน 2026-07-30: concat ข้าม format ทำให้เสียงหายเงียบ โดยไม่มี error สักบรรทัด)
+    ⇒ สัญญาจริงเขียนไว้ตรงนี้ และ **บังคับด้วยเทสต์ที่ decode ของจริง** ไม่ใช่ด้วยชนิดข้อมูล:
+
+        synth() ต้องคืน MP3 · 24 kHz · mono · 128 kbps · ผ่านเกนคงที่ของ engine ตัวเองแล้ว
+        ⇒ ต่อกันได้โดยไม่ต้องแปลงอีก และสลับ engine กลางบทความแล้วความดังไม่กระโดด
+    """
+
     name: str
     max_concurrency: int
 
@@ -61,14 +73,34 @@ class GoogleEngine:
 
     name = "google"
 
+    URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
+
     def __init__(self, api_key: str, default_voice: str, max_concurrency: int = 4,
                  connect_timeout: float = 10.0, read_timeout: float = 15.0,
                  max_retries: int = 0) -> None:
-        self._url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={api_key}"
+        # key อยู่ใน **header** ไม่ใช่ query string — httpx log บรรทัด
+        # "HTTP Request: POST <url>" ที่ระดับ INFO ⇒ key ใน ?key= จะไหลลง log ทุกครั้งที่ยิง
+        # (พี่ AgentA จับได้ตอน review PR B — ของเดิม carry มาจาก bot.py ไม่ใช่ regression)
+        self._headers = {"X-Goog-Api-Key": api_key}
         self._default_voice = default_voice
         self.max_concurrency = max_concurrency
         self._timeout = httpx.Timeout(read_timeout, connect=connect_timeout)
         self._max_retries = max_retries
+        self._client: Optional[httpx.AsyncClient] = None
+        self._client_lock = asyncio.Lock()
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        """client ตัวเดียวใช้ซ้ำ — เปิดใหม่ทุก chunk เสียเวลา handshake +3% ต่อ chunk (วัดแล้ว)"""
+        if self._client is None or self._client.is_closed:
+            async with self._client_lock:
+                if self._client is None or self._client.is_closed:
+                    self._client = httpx.AsyncClient(timeout=self._timeout,
+                                                     headers=self._headers)
+        return self._client
+
+    async def aclose(self) -> None:
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
 
     async def synth(self, chunk: str, voice: VoiceSpec) -> bytes:
         name = voice.google_voice or self._default_voice
@@ -78,34 +110,35 @@ class GoogleEngine:
             "voice": {"languageCode": lang, "name": name},
             "audioConfig": {"audioEncoding": "MP3"},
         }
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            for attempt in range(self._max_retries + 1):
-                start = time.monotonic()
-                try:
-                    resp = await client.post(self._url, json=payload)
-                except (httpx.TimeoutException, httpx.TransportError) as exc:
-                    if attempt >= self._max_retries:
-                        raise EngineUnavailable(f"Google TTS ติดต่อไม่ได้: {exc}") from exc
-                    await asyncio.sleep(2 * (attempt + 1))
-                    continue
+        client = await self._get_client()
+        for attempt in range(self._max_retries + 1):
+            start = time.monotonic()
+            try:
+                resp = await client.post(self.URL, json=payload)
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                if attempt >= self._max_retries:
+                    raise EngineUnavailable(f"Google TTS ติดต่อไม่ได้: {exc}") from exc
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
 
-                elapsed_ms = int((time.monotonic() - start) * 1000)
-                if resp.status_code == 200:
-                    LOGGER.info("engine=google voice=%s bytes=%d elapsed=%dms",
-                                name, len(chunk.encode()), elapsed_ms)
-                    return base64.b64decode(resp.json()["audioContent"])
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            if resp.status_code == 200:
+                LOGGER.info("engine=google voice=%s bytes=%d elapsed=%dms",
+                            name, len(chunk.encode()), elapsed_ms)
+                raw = base64.b64decode(resp.json()["audioContent"])
+                return await audio_format.encode(raw, audio_format.ENGINE_GAIN_DB[self.name])
 
-                try:
-                    err = resp.json().get("error", {}).get("message", resp.text[:200])
-                except ValueError:
-                    err = resp.text[:200]
-                if resp.status_code in {429, 500, 502, 503, 504} and attempt < self._max_retries:
-                    await asyncio.sleep(2 * (attempt + 1))
-                    continue
-                # 4xx ที่ไม่ใช่ 429 = คำขอผิด ไม่ใช่ engine ล่ม ⇒ ไม่ส่งต่อ chain ให้ล้มเลย
-                if 400 <= resp.status_code < 500 and resp.status_code != 429:
-                    raise RuntimeError(f"Google TTS: {err}")
-                raise EngineUnavailable(f"Google TTS: {err}")
+            try:
+                err = resp.json().get("error", {}).get("message", resp.text[:200])
+            except ValueError:
+                err = resp.text[:200]
+            if resp.status_code in {429, 500, 502, 503, 504} and attempt < self._max_retries:
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
+            # 4xx ที่ไม่ใช่ 429 = คำขอผิด ไม่ใช่ engine ล่ม ⇒ ไม่ส่งต่อ chain ให้ล้มเลย
+            if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                raise RuntimeError(f"Google TTS: {err}")
+            raise EngineUnavailable(f"Google TTS: {err}")
         raise EngineUnavailable("Google TTS ล้มหลังลองครบ")
 
 
@@ -172,7 +205,12 @@ class LocalF5Engine:
             self._load_failed = f"{type(exc).__name__}: {exc}"
             raise EngineUnavailable(f"โหลด F5 ไม่ได้: {exc}") from exc
 
-    def _infer_to_mp3(self, chunk: str, voice: VoiceSpec) -> bytes:
+    def _infer_to_wav(self, chunk: str, voice: VoiceSpec) -> bytes:
+        """คืน WAV ดิบจากโมเดล — ยังไม่ใช่ของที่ส่งออก ต้องผ่าน audio_format ก่อน
+
+        ชื่อเดิมคือ `_infer_to_mp3` แต่คืน WAV — พี่ AgentA จับได้ตอน review PR B
+        ชื่อที่โกหกคือหนี้ที่รอวันหลอกคนอ่านคนถัดไป แก้ตอนนี้พร้อมกับที่ format contract ล็อก
+        """
         import io
 
         import numpy as np
@@ -183,8 +221,6 @@ class LocalF5Engine:
                         step=self._step, cfg=self._cfg, speed=self._speed)
         arr = np.asarray(wav, dtype="float32").squeeze()
         buf = io.BytesIO()
-        # ส่ง WAV ออกจาก engine — bot ส่งเข้า Telegram ได้ตรงๆ
-        # loudnorm/mp3 เป็นขั้น encode แยก ไม่ใช่หน้าที่ของ engine
         sf.write(buf, arr, self._sample_rate, format="WAV")
         return buf.getvalue()
 
@@ -198,10 +234,11 @@ class LocalF5Engine:
         self.check_text(chunk)
         async with self._lock:
             start = time.monotonic()
-            audio = await asyncio.to_thread(self._infer_to_mp3, chunk, voice)
+            raw = await asyncio.to_thread(self._infer_to_wav, chunk, voice)
             LOGGER.info("engine=local-f5 agent=%s chars=%d elapsed=%dms",
                         voice.agent, len(chunk), int((time.monotonic() - start) * 1000))
-            return audio
+        # encode นอก lock — ffmpeg ไม่แตะ GPU ให้ chunk ถัดไปเข้าโมเดลได้เลย
+        return await audio_format.encode(raw, audio_format.ENGINE_GAIN_DB[self.name])
 
 
 @dataclass
