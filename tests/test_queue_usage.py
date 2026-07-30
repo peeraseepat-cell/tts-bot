@@ -80,8 +80,15 @@ class OutputPartTests(unittest.TestCase):
         self.assertTrue(all(part.endswith(bot.SENTENCE_ENDINGS) for part in parts))
         self.assertTrue(all(len(bot._split_text(part)) <= bot.TTS_PART_MAX_CHUNKS for part in parts))
 
-    def test_collect_window_default_is_five_seconds(self):
-        self.assertEqual(bot.COLLECT_WINDOW_SECONDS, 5)
+    def test_collect_window_default_is_two_seconds(self):
+        # 5 -> 2 วิ 2026-07-30 · เทสต์นี้ล็อกเลขไว้โดยเจตนา: ใครเปลี่ยนต้องมาแก้ที่นี่ด้วย
+        # ⇒ การเปลี่ยน "เวลาที่ผู้ใช้ต้องรอ" จะเกิดขึ้นเงียบๆ ไม่ได้
+        self.assertEqual(bot.COLLECT_WINDOW_SECONDS, 2)
+
+    def test_collect_window_stays_overridable_by_env(self):
+        # ถ้า 2 วิ สั้นเกินสำหรับใครบางคน ต้องปรับได้ด้วย env var ไม่ใช่ต้องแก้ code + redeploy
+        src = open(bot.__file__, encoding="utf-8").read()
+        self.assertIn('os.environ.get("COLLECT_WINDOW_SECONDS"', src)
 
     def test_tts_timeout_defaults_support_long_voice_uploads(self):
         self.assertEqual(bot.TTS_PART_MAX_CHUNKS, 12)

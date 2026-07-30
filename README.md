@@ -75,7 +75,7 @@ All configuration is via environment variables. Only the first two are required.
 | `TTS_VOICE` | | `th-TH-Chirp3-HD-Achernar` | Any Google Cloud TTS voice name |
 | `SUPABASE_URL` / `SUPABASE_KEY` | | — | Enables persistent per-user usage metering |
 | `TTS_MONTHLY_FREE_CHARS` | | `1000000` | Monthly character quota per user |
-| `COLLECT_WINDOW_SECONDS` | | `5` | How long to wait for follow-up messages before narrating |
+| `COLLECT_WINDOW_SECONDS` | | `2` | How long to wait for follow-up messages before narrating (was `5`; lowered 2026-07-30 — real usage is one pasted article, so the extra wait bought nothing) |
 | `TTS_PART_SIZE` | | `1950` | Target characters per audio file |
 | `PORT` | | `8443` | Webhook port |
 

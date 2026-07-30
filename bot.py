@@ -29,7 +29,12 @@ MAX_CHARS = 20000
 CHUNK_SIZE = 250
 PART_SIZE = int(os.environ.get("TTS_PART_SIZE", 1950))
 TTS_PART_MAX_CHUNKS = int(os.environ.get("TTS_PART_MAX_CHUNKS", 12))
-COLLECT_WINDOW_SECONDS = float(os.environ.get("COLLECT_WINDOW_SECONDS", 5))
+# 5 -> 2 วิ (2026-07-30) — หน้าต่างรวมข้อความก่อนเริ่มสังเคราะห์
+# 5 วิ ถูกตั้งไว้ตอนยังไม่รู้ว่าใครใช้อย่างไร · ของจริง Boommer วางบทความ *ใบเดียว*
+# แล้วรอ ⇒ 5 วิ กลายเป็นเวลารอเปล่าๆ ทุกครั้ง ไม่ใช่เวลาที่ใช้รวมอะไร
+# ยังเหลือ 2 วิ ไว้เพราะเคสวางหลายท่อนติดกันมีจริง (แชทมือถือแยกข้อความเอง)
+# ปรับได้ด้วย env var โดยไม่ต้อง redeploy — เลขนี้ล็อกด้วยเทสต์ ถ้าใครเปลี่ยนต้องเปลี่ยนเจตนาด้วย
+COLLECT_WINDOW_SECONDS = float(os.environ.get("COLLECT_WINDOW_SECONDS", 2))
 MONTHLY_FREE_CHARS = int(os.environ.get("TTS_MONTHLY_FREE_CHARS", 1_000_000))
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
