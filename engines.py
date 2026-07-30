@@ -213,10 +213,13 @@ class LocalF5Engine:
         """
         import io
 
-        import numpy as np
-        import soundfile as sf
+        tts = self._ensure_model()          # ก่อน import หนัก — เหตุผลเดียวกับ _infer_long_to_wav
+        try:
+            import numpy as np
+            import soundfile as sf
+        except ImportError as exc:
+            raise EngineUnavailable(f"ไม่มี dependency ของ local engine: {exc}") from exc
 
-        tts = self._ensure_model()
         wav = tts.infer(ref_audio=voice.ref_wav, ref_text=voice.ref_text, gen_text=chunk,
                         step=self._step, cfg=self._cfg, speed=self._speed)
         arr = np.asarray(wav, dtype="float32").squeeze()
@@ -239,6 +242,88 @@ class LocalF5Engine:
                         voice.agent, len(chunk), int((time.monotonic() - start) * 1000))
         # encode นอก lock — ffmpeg ไม่แตะ GPU ให้ chunk ถัดไปเข้าโมเดลได้เลย
         return await audio_format.encode(raw, audio_format.ENGINE_GAIN_DB[self.name])
+
+    # ---------- เส้นยาวไฟล์เดียว (AMEND-2) ----------
+    def _infer_long_to_wav(self, text: str, voice: VoiceSpec) -> tuple:
+        """หั่นเอง -> infer ทีละก้อน -> ต่อด้วยความเงียบที่คุมเอง -> WAV ก้อนเดียว
+
+        ทำไมไม่โยนทั้งก้อนให้ `TTS.infer()` หั่นเอง ทั้งที่เร็วกว่า 22% —
+        **วัดที่ 1/5/20 นาที แล้ว VRAM ของสองวิธีคนละพฤติกรรม**:
+            lib   889 -> 1222 -> 2341 MB   (โตตามความยาวข้อความ)
+            หั่นเอง 801 ->  804 ->  806 MB   (คงที่)
+        งบ VRAM ที่เหลือให้ LLM บนเครื่องนี้คือ ~12.8 GB ⇒ เส้นที่โตตาม input
+        จะเอาเพดานความยาวบทความไปผูกกับ LLM ที่ยังไม่ได้ลง
+        (ref drift วัดแล้ว **ไม่มีทั้งสองวิธี** ตลอด 20 นาที ⇒ ไม่ใช่เกณฑ์ตัดสิน)
+        """
+        import io
+
+        from thai_text import LIB_MAX_CHARS, MAX_CHUNK, plan
+
+        # ลำดับสำคัญ: ตรวจสถานะโมเดล **ก่อน** แตะ dependency หนัก
+        # ถ้า import numpy/soundfile ก่อน เครื่องที่ไม่มีของพวกนี้ (deploy แบบ Google-only)
+        # จะได้ ModuleNotFoundError ซึ่ง **ไม่ใช่ EngineUnavailable** ⇒ ไม่ตกไป fallback
+        # แต่ทำให้ทั้ง job ล้ม — เทสต์ซ้อมด่านข้อ 3 จับได้ตอนเขียน ไม่ใช่ตอน deploy
+        tts = self._ensure_model()
+        try:
+            import numpy as np
+            import soundfile as sf
+        except ImportError as exc:
+            raise EngineUnavailable(f"ไม่มี dependency ของ local engine: {exc}") from exc
+
+        items, stat = plan(text, MAX_CHUNK)
+        if not items:
+            raise EngineUnavailable("ไม่มีข้อความให้อ่านหลังหั่น")
+        if stat["max_chunk"] > LIB_MAX_CHARS:
+            # ด่านนี้กันไม่ให้ lib หั่นซ้ำก้อนของเรา — ถ้าโดนหั่นซ้ำ เราคุม pause ไม่ได้แล้ว
+            raise EngineUnavailable(
+                f"ก้อนยาว {stat['max_chunk']} เกิน max_chars ที่ส่งให้ lib ({LIB_MAX_CHARS})")
+
+        pieces = []
+        for chunk, gap in items:
+            wav = tts.infer(ref_audio=voice.ref_wav, ref_text=voice.ref_text, gen_text=chunk,
+                            step=self._step, cfg=self._cfg, speed=self._speed,
+                            max_chars=LIB_MAX_CHARS)
+            pieces.append(np.asarray(wav, dtype="float32").squeeze())
+            if gap:
+                pieces.append(np.zeros(int(gap * self._sample_rate), dtype="float32"))
+        arr = np.concatenate(pieces)
+        buf = io.BytesIO()
+        sf.write(buf, arr, self._sample_rate, format="WAV")
+        return buf.getvalue(), stat, len(arr) / self._sample_rate
+
+    async def synth_long(self, text: str, voice: VoiceSpec) -> "LongSynthResult":
+        """ทั้ง job เป็นไฟล์เดียว — ไม่แบ่ง part (AMEND-2)
+
+        ด่าน translit ตรวจ **ทั้งข้อความ** ก่อนแตะโมเดล: ถ้ามีละตินตกค้างแม้จุดเดียว
+        ตกทั้ง job ไปเส้น fallback — ไม่ใช่ปล่อยครึ่งเสียงครึ่งเงียบ
+        """
+        if voice.engine != "local":
+            raise EngineUnavailable(f"voice ของ {voice.agent} ไม่ได้ตั้งให้ใช้ local")
+        if not voice.ref_wav or not voice.ref_text:
+            raise EngineUnavailable(f"voice ของ {voice.agent} ไม่มี ref audio/text")
+        if not os.path.exists(voice.ref_wav):
+            raise EngineUnavailable(f"ref audio หายจากดิสก์: {voice.ref_wav}")
+        self.check_text(text)
+        async with self._lock:
+            start = time.monotonic()
+            raw, stat, seconds = await asyncio.to_thread(self._infer_long_to_wav, text, voice)
+            wall = time.monotonic() - start
+            LOGGER.info("engine=local-f5 long agent=%s chars=%d chunks=%d hard_cuts=%d "
+                        "audio=%.1fs wall=%.1fs rtf=%.4f",
+                        voice.agent, len(text), stat["chunks"], stat["hard_cuts"],
+                        seconds, wall, wall / seconds if seconds else float("nan"))
+        audio = await audio_format.encode(raw, audio_format.ENGINE_GAIN_DB[self.name])
+        return LongSynthResult(audio=audio, engine=self.name, seconds=seconds,
+                               chunks=stat["chunks"], hard_cuts=stat["hard_cuts"])
+
+
+@dataclass
+class LongSynthResult:
+    audio: bytes
+    engine: str
+    seconds: float
+    chunks: int
+    hard_cuts: int
 
 
 @dataclass

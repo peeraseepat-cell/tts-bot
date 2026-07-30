@@ -258,3 +258,79 @@ def residual_latin(text: str):
 
 def residual_digits(text: str):
     return sorted(set(re.findall(r"\d+", text)))
+
+
+# ---------------------------------------------------------------------------
+# ชั้นหั่นข้อความ — ย้ายมาจาก AgentP-oracle/ψ/lab/chunk_th.py (อัลกอริทึมเดียวกันเป๊ะ)
+#
+# ⚠️ หนี้ที่รู้ตัวและยังไม่ปิด: ไฟล์นี้เป็นสำเนาที่สองของ ψ/lab/translit_th.py + chunk_th.py
+# 3 ทางเลือก (แยก package / git submodule / ยอมรับสำเนาแล้วมีเทสต์เทียบ) ยังรอเคาะ
+# เอามาไว้ที่นี่แทนที่จะสร้างไฟล์ใหม่ เพราะสำเนาที่สามแย่กว่าสำเนาที่สอง
+#
+# ทำไมต้องหั่นเอง ทั้งที่ TTS.infer() หั่นให้อยู่แล้ว — **วัดแล้วที่ 1/5/20 นาที**:
+#   VRAM peak   lib 889 -> 1222 -> 2341 MB (โตตามความยาว)  ·  หั่นเอง 801 -> 804 -> 806 MB (คงที่)
+#   เวลา        lib เร็วกว่า 22% (145.1 s vs 186.1 s ที่ ~20 นาที)
+#   ความเงียบ   lib 0.9 s ตลอด 19 นาที · หั่นเอง 89.3 s ตลอด 20.4 นาที
+#   ref drift   **ไม่มีทั้งสองแบบ** (|t| < 1.3 ตลอด 20 นาที)
+# ⇒ เลือกหั่นเองเพราะ VRAM คงที่ ไม่ใช่เพราะเสียงดีกว่า — ข้อหลังยังไม่มีใครตัดสิน
+#   (AgentP-oracle/ψ/memory/learnings/2026-07-30_longform-who-chunks.md)
+#
+# จุดตัดที่ยอมรับ เรียงตามความอยากได้:
+#   1. ขอบย่อหน้า        -> เงียบ 0.55 s
+#   2. ช่องว่างในย่อหน้า  -> เงียบ 0.22 s  (ภาษาไทยใช้ space แทนเครื่องหมายวรรคตอน)
+#   3. ไม่มีช่องว่างเลย   -> ตัดดิบที่ MAX_CHUNK และ **นับไว้รายงาน ห้ามเงียบ**
+
+MAX_CHUNK = 90
+GAP_PARA = 0.55
+GAP_MID = 0.22
+LIB_MAX_CHARS = 200      # > MAX_CHUNK เพื่อให้ lib ไม่มีโอกาสหั่นก้อนของเราซ้ำ
+
+_STRIP = str.maketrans({'"': None, "“": None, "”": None,
+                        "‘": None, "’": None})
+
+
+def paragraphs(text: str) -> list:
+    return [ln.strip() for ln in text.translate(_STRIP).split("\n") if ln.strip()]
+
+
+def split_para(p: str, max_chars: int = MAX_CHUNK) -> list:
+    """คืน [(ก้อน, ตัดดิบไหม)] — ทุกก้อน <= max_chars และตัดที่ช่องว่างก่อนเสมอ"""
+    out, cur = [], ""
+    for tok in p.split(" "):
+        if not tok:
+            continue
+        cand = tok if not cur else cur + " " + tok
+        if len(cand) <= max_chars:
+            cur = cand
+            continue
+        if cur:
+            out.append((cur, False))
+            cur = ""
+        while len(tok) > max_chars:      # ก้อนเดียวยาวเกิน ไม่มีช่องว่าง = ตัดกลางคำ
+            out.append((tok[:max_chars], True))
+            tok = tok[max_chars:]
+        cur = tok
+    if cur:
+        out.append((cur, False))
+    return out
+
+
+def plan(text: str, max_chars: int = MAX_CHUNK):
+    """คืน ([(chunk, gap_after_sec)], สถิติ) — gap คือความเงียบที่เราคุมเอง"""
+    items, hard_cuts = [], 0
+    paras = paragraphs(text)
+    if not paras:
+        return [], {"paragraphs": 0, "chunks": 0, "hard_cuts": 0,
+                    "max_chunk": 0, "mean_chunk": 0.0}
+    for pi, p in enumerate(paras):
+        chunks = split_para(p, max_chars)
+        for ci, (c, hard) in enumerate(chunks):
+            last = ci == len(chunks) - 1
+            gap = GAP_PARA if last else GAP_MID
+            if pi == len(paras) - 1 and last:
+                gap = 0.0                # ไม่ต้องมีความเงียบต่อท้ายไฟล์
+            items.append((c, gap))
+            hard_cuts += int(hard)
+    return items, {"paragraphs": len(paras), "chunks": len(items), "hard_cuts": hard_cuts,
+                   "max_chunk": max(len(c) for c, _ in items),
+                   "mean_chunk": round(sum(len(c) for c, _ in items) / len(items), 1)}
