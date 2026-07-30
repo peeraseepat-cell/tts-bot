@@ -152,6 +152,48 @@ def count_samples(data: bytes) -> int:
     return len(proc.stdout) // 2        # s16le = 2 ไบต์ต่อ sample
 
 
+def preflight() -> AudioInfo:
+    """ตรวจว่าเครื่องนี้ encode ตาม contract ได้จริง — เรียกตอน startup ก่อนรับงานชิ้นแรก
+
+    ทำไมต้องมี: ตัวเลขทั้งชุดวัดบน **ffmpeg 6.1.1 (Ubuntu)** แต่ image ที่ deploy คือ
+    `python:3.12-slim` = Debian bookworm ซึ่งให้ **ffmpeg 5.1.x** — คนละรุ่น
+    ถ้ารุ่นนั้นไม่มี option `latency` ของ `alimiter` หรือไม่มี `libmp3lame`
+    filter string จะพังทุก synth **โดยที่ไม่มีใครรู้จนกว่าจะมีคนส่งข้อความแรกเข้ามา**
+
+    ด่านนี้ย้ายความล้มจาก "ตอนผู้ใช้รอเสียง" มาเป็น "ตอน process ขึ้น" — ล้มดังกว่าและถูกที่กว่า
+    ⚠️ ยังไม่ได้รันบน image จริง: pc-office ไม่มี docker ⇒ ข้อนั้นยัง **INCONCLUSIVE**
+    """
+    import io
+    import math
+    import struct
+    import wave
+
+    frames, rate = 4800, SAMPLE_RATE          # 0.2 วินาที พอให้ ebur128 มีอะไรอ่าน
+    pcm = bytearray()
+    for i in range(frames):
+        pcm += struct.pack("<h", int(0.3 * 32767 * math.sin(2 * math.pi * 220 * i / rate)))
+    bio = io.BytesIO()
+    with wave.open(bio, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(bytes(pcm))
+
+    try:
+        out = encode_sync(bio.getvalue(), 0.0)
+    except FileNotFoundError as exc:
+        raise FormatError(
+            "ไม่มี ffmpeg/ffprobe บนเครื่องนี้ — audio_format เรียกใช้ตรงๆ "
+            "ทั้งเส้น local และเส้น Google-only ⇒ ติดตั้งก่อนรัน bot"
+        ) from exc
+    info = probe(out)
+    if not info.matches_contract():
+        raise FormatError(f"ffmpeg บนเครื่องนี้ encode ไม่ตรง contract: {info}")
+    if info.samples < frames // 2:
+        raise FormatError(f"encode แล้วเสียงหายไปเกือบหมด: {info.samples} sample")
+    return info
+
+
 def measure_loudness(data: bytes) -> Optional[float]:
     """integrated LUFS — ใช้ในเทสต์ ไม่ได้อยู่บนเส้นทางจริงตอนส่งงาน"""
     proc = subprocess.run(

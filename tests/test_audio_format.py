@@ -142,6 +142,15 @@ def test_ค่าคงที่ที่วัดไว้ยังตรง�
         assert af.ENGINE_GAIN_DB[name] == pytest.approx(expected, abs=0.05)
 
 
+def test_preflight_ผ่านบนเครื่องนี้():
+    """ด่าน startup — ตรวจว่า ffmpeg ของเครื่องที่กำลังรัน encode ตาม contract ได้จริง
+
+    บน pc-office ผ่าน (ffmpeg 6.1.1) · บน image ที่ deploy **ยังไม่เคยรัน** เพราะไม่มี docker
+    """
+    info = af.preflight()
+    assert info.matches_contract()
+
+
 # ---------- เส้นทางจริงของ engine (ไม่ใช่ FakeEngine) ----------
 
 def test_google_engine_บีบ_output_เข้า_contract():
