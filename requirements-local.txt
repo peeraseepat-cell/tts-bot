@@ -1,0 +1,15 @@
+# ⚠️ ของที่ไม่ได้อยู่ในไฟล์นี้ แต่ **ทั้งสองเส้นทาง** ต้องมี: **ffmpeg + ffprobe** (system binary)
+#    `audio_format.py` เรียกตรงๆ — ไม่มี = ทุก synth ล้มด้วย FileNotFoundError
+#    รวมถึง deploy แบบ Google-only ที่ไม่ได้ลงไฟล์นี้ ⇒ ต้องอยู่ใน image เสมอ
+#    pc-office: ffmpeg 6.1.1 (มี alimiter + ebur128 ครบ) · **Dockerfile ยังไม่ได้เพิ่ม — ต้องเพิ่มก่อน deploy**
+#
+# dependency ของ local engine เท่านั้น — deploy แบบ Google-only ไม่ต้องลงชุดนี้
+# แยกจาก requirements.txt เพราะ torch + f5-tts-th หนักหลาย GB และไม่จำเป็นถ้าไม่เปิด local
+#
+# ⚠️ torch ต้องเป็น build ที่มี sm_120 สำหรับ RTX 5070 Ti (Blackwell)
+# บน pc-office ใช้ UV_TORCH_BACKEND=auto ไม่ใช่ cu124
+# ดู AgentP-oracle/ψ/memory/learnings/2026-07-28_blackwell-sm120-torch-backend.md
+f5-tts-th==1.0.9
+pythainlp==5.3.4
+soundfile==0.14.0
+numpy==1.26.4

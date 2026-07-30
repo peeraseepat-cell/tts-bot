@@ -41,6 +41,14 @@ TTS_FILE_TIMEOUT = float(os.environ.get("TTS_FILE_TIMEOUT", 60))
 TELEGRAM_SEND_TIMEOUT = float(os.environ.get("TELEGRAM_SEND_TIMEOUT", 90))
 PORT = int(os.environ.get("PORT", 8443))
 
+# ---------- local-first TTS (ปิดโดย default — ทางถอนของ design ข้อ 6.4) ----------
+# "ปิดสนิทได้ ไม่มี half-door": USE_LOCAL_TTS != 1 ⇒ ไม่ import engines/torch เลย
+# พฤติกรรมเท่าของเดิมเป๊ะ และ Google-only deploy ไม่ต้องแบก path นั้น
+USE_LOCAL_TTS = os.environ.get("USE_LOCAL_TTS", "0") == "1"
+LOCAL_REF_WAV = os.environ.get("TTS_LOCAL_REF_WAV", "")
+LOCAL_REF_TEXT_FILE = os.environ.get("TTS_LOCAL_REF_TEXT_FILE", "")
+LOCAL_AGENT = os.environ.get("TTS_LOCAL_AGENT", "Boommer")
+
 
 def _parse_allowed_chat_ids(raw: str) -> frozenset[int]:
     return frozenset(int(part) for part in raw.replace(",", " ").split())
@@ -350,7 +358,19 @@ async def _synthesize_part(
             audio_parts.append(await _post_tts_chunk(client, chunk))
             used_chars += len(chunk)
             summary = USAGE_METER.record(len(chunk))
-    return b"".join(audio_parts), used_chars, len(chunks), summary
+
+    # 🔴 เส้นนี้คือเส้น **fallback** — ถ้าไม่ผ่าน format contract ช่องว่างความดัง 3.0 LU
+    # ระหว่าง F5 (-15.75 LUFS ดิบ) กับ Google (-18.72 LUFS ดิบ) จะกลับมาโผล่
+    # **ตรงจังหวะสลับ engine พอดี** ซึ่งเป็นจังหวะเดียวที่ contract มีไว้เพื่อมัน
+    # (contract ที่ติดอยู่บนถนนเส้นเดียวจากสองเส้น = ไม่ได้ครอบอะไรเลย)
+    #
+    # encode **ครั้งเดียวหลังต่อครบ** ไม่ใช่ทีละ chunk — LAME ใส่ padding หัวไฟล์ ~0.06 s ทุกครั้ง
+    # ที่ encode ⇒ encode ทีละ chunk จะได้ความเงียบสะสมตรงรอยต่อทุกจุด (วัดแล้วว่าคงที่ต่อครั้ง)
+    import audio_format
+
+    joined = b"".join(audio_parts)
+    encoded = await audio_format.encode(joined, audio_format.ENGINE_GAIN_DB["google"])
+    return encoded, used_chars, len(chunks), summary
 
 
 async def _synthesize(text: str) -> bytes:
@@ -467,7 +487,73 @@ async def _tts_worker(app: Application) -> None:
             queue.task_done()
 
 
+_LOCAL_ENGINE = None
+_LOCAL_VOICE = None
+
+
+def _get_local_engine():
+    """สร้าง engine ตัวเดียวใช้ซ้ำ — import ที่นี่เพื่อให้ Google-only ไม่ต้องแบก torch"""
+    global _LOCAL_ENGINE, _LOCAL_VOICE
+    if _LOCAL_ENGINE is None:
+        import engines
+
+        if not LOCAL_REF_WAV or not LOCAL_REF_TEXT_FILE:
+            raise engines.EngineUnavailable(
+                "เปิด USE_LOCAL_TTS แต่ไม่ได้ตั้ง TTS_LOCAL_REF_WAV / TTS_LOCAL_REF_TEXT_FILE")
+        with open(LOCAL_REF_TEXT_FILE, encoding="utf-8") as fh:
+            ref_text = fh.read().strip()
+        _LOCAL_ENGINE = engines.LocalF5Engine()
+        _LOCAL_VOICE = engines.VoiceSpec(agent=LOCAL_AGENT, engine="local",
+                                         ref_wav=LOCAL_REF_WAV, ref_text=ref_text)
+    return _LOCAL_ENGINE, _LOCAL_VOICE
+
+
+async def _process_job_local(app: Application, job: TTSJob) -> bool:
+    """เส้น F5 — ทั้ง job เป็นไฟล์เดียว ไม่แบ่ง part (AMEND-2)
+
+    คืน True = จบงานแล้ว · False = engine รับงานนี้ไม่ได้ ให้เส้น Google เดิมทำต่อ
+    **ห้ามคืน False หลังส่งไฟล์ไปแล้ว** ไม่งั้นผู้ใช้จะได้เสียงซ้ำสองรอบ
+    """
+    import engines
+
+    try:
+        engine, voice = _get_local_engine()
+    except Exception as exc:
+        LOGGER.warning("local engine ตั้งค่าไม่ครบ ตกไปเส้น Google: %s", exc)
+        return False
+
+    await _safe_edit_or_send(app, job.chat_id, job.status_message_id,
+                             "กำลังสร้างเสียงด้วยเครื่องนี้ (ไฟล์เดียว ไม่แบ่งท่อน)...")
+    try:
+        result = await engine.synth_long(job.text, voice)
+    except engines.EngineUnavailable as exc:
+        # ด่านตีตก (ละตินตกค้าง / ref หาย / โหลดโมเดลไม่ได้) ⇒ ผู้ฟังต้องรู้ว่ากำลังจะได้ยินเสียงใคร
+        LOGGER.warning("local engine ส่งต่อเส้น Google: %s", exc)
+        await _safe_edit_or_send(
+            app, job.chat_id, job.status_message_id,
+            f"เครื่องนี้รับงานนี้ไม่ได้ ({exc}) — เปลี่ยนไปใช้เสียงสำรอง")
+        return False
+
+    voice_file = io.BytesIO(result.audio)
+    voice_file.name = "tts_local.mp3"
+    caption = (f"{len(job.text):,} ตัวอักษร · {result.seconds / 60:.1f} นาที · "
+               f"{result.chunks} ท่อน · เสียงจากเครื่องนี้")
+    if result.hard_cuts:
+        # ตัดกลางคำเพราะไม่มีช่องว่างให้ตัด — รายงาน ไม่ซ่อน
+        caption += f" · ⚠️ ตัดกลางคำ {result.hard_cuts} จุด"
+    await _send_voice_with_timeout(app=app, chat_id=job.chat_id,
+                                   voice=voice_file, caption=caption)
+    await _safe_edit_or_send(
+        app, job.chat_id, job.status_message_id,
+        "เสร็จแล้ว (เสียงจากเครื่องนี้ — ไม่ใช้โควตา Google)\n"
+        + _format_runtime_status(USAGE_METER.preview()))
+    return True
+
+
 async def _process_job(app: Application, job: TTSJob) -> None:
+    if USE_LOCAL_TTS and await _process_job_local(app, job):
+        return
+
     total_used = 0
     total_requests = 0
     summary = USAGE_METER.preview()
@@ -595,6 +681,14 @@ async def handle_text(update: Update, context):
 
 
 def main():
+    # ด่าน startup — ffmpeg เป็น runtime dependency ของ **ทั้งสองเส้นทาง**
+    # ถ้าไม่มี ต้องรู้ตอน process ขึ้น ไม่ใช่ตอนผู้ใช้คนแรกรอเสียงอยู่
+    import audio_format
+
+    info = audio_format.preflight()
+    LOGGER.info("audio preflight ผ่าน: %s %dHz %dch", info.codec, info.sample_rate, info.channels)
+    LOGGER.info("local TTS: %s", "เปิด" if USE_LOCAL_TTS else "ปิด (ใช้ Google อย่างเดียว)")
+
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
