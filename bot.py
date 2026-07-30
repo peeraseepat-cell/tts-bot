@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import collections
 import contextlib
 import hashlib
 import io
@@ -203,9 +204,61 @@ class UsageMeter:
         return self._summary(self._read(current_time), current_time)
 
 
+class FairJobQueue:
+    """คิวยุติธรรมต่อ chat — worker หยิบสลับ chat ไม่ใช่หยิบตามลำดับที่เข้ามา
+
+    คิวเดิมเป็น asyncio.Queue ตัวเดียว: ใครส่งบทความยาวก่อน คนที่ส่งประโยคเดียว
+    รอจนบทความนั้นจบทุกไฟล์ คิวนี้ให้แต่ละ chat มีคิวย่อยของตัวเอง แล้ววน round-robin
+    ⇒ chat ที่มีงานค้างเยอะไม่ยึดคิวทั้งระบบ
+
+    หมายเหตุ: นี่แก้ *ความยุติธรรม* ไม่ได้แก้ *ปริมาณงานต่อวินาที* — งานยังถูกทำทีละชิ้น
+    โดยเจตนา เพราะวัดแล้วว่า F5 บน GPU เดียวขนานแล้วแย่ลง
+    (ψ/memory/learnings/2026-07-30_f5-concurrency-ram-ceiling.md ฝั่ง AgentP)
+    """
+
+    def __init__(self) -> None:
+        self._by_chat: dict[int, collections.deque] = {}
+        self._order: collections.deque = collections.deque()
+        self._available = asyncio.Event()
+        self._size = 0
+
+    def qsize(self) -> int:
+        return self._size
+
+    def pending_for(self, chat_id: int) -> int:
+        return len(self._by_chat.get(chat_id, ()))
+
+    async def put(self, job: "TTSJob") -> None:
+        chat_queue = self._by_chat.get(job.chat_id)
+        if chat_queue is None:
+            chat_queue = self._by_chat[job.chat_id] = collections.deque()
+        if not chat_queue:
+            self._order.append(job.chat_id)
+        chat_queue.append(job)
+        self._size += 1
+        self._available.set()
+
+    async def get(self) -> "TTSJob":
+        while self._size == 0:
+            self._available.clear()
+            await self._available.wait()
+        chat_id = self._order.popleft()
+        chat_queue = self._by_chat[chat_id]
+        job = chat_queue.popleft()
+        self._size -= 1
+        if chat_queue:
+            self._order.append(chat_id)          # เหลืองาน -> ต่อท้าย ไม่ใช่แซงหน้า
+        else:
+            del self._by_chat[chat_id]
+        return job
+
+    def task_done(self) -> None:
+        """คงไว้ให้ worker เดิมเรียกได้เหมือน asyncio.Queue — คิวนี้ไม่ต้อง join"""
+
+
 USAGE_METER = UsageMeter(MONTHLY_FREE_CHARS, USAGE_TIMEZONE)
 PENDING_BUFFERS: dict[int, PendingChatBuffer] = {}
-JOB_QUEUE: Optional[asyncio.Queue] = None
+JOB_QUEUE: Optional[FairJobQueue] = None
 WORKER_TASK: Optional[asyncio.Task] = None
 
 
@@ -284,10 +337,10 @@ def _format_runtime_status(summary: UsageSummary) -> str:
     )
 
 
-def _get_queue() -> asyncio.Queue:
+def _get_queue() -> FairJobQueue:
     global JOB_QUEUE
     if JOB_QUEUE is None:
-        JOB_QUEUE = asyncio.Queue()
+        JOB_QUEUE = FairJobQueue()
     return JOB_QUEUE
 
 
@@ -428,7 +481,10 @@ async def _flush_chat_after_delay(chat_id: int, app: Application) -> None:
     parts = _split_output_parts(text)
     request_count = _estimate_tts_requests(parts)
     queue = _get_queue()
-    queue_position = queue.qsize() + 1
+    # คิวเป็น round-robin ต่อ chat แล้ว ⇒ "ลำดับที่ N" ในคิวรวมไม่เป็นความจริงอีก
+    # รายงานสิ่งที่รู้จริง: งานที่รออยู่ทั้งหมด และงานที่รออยู่ของ chat นี้
+    waiting_total = queue.qsize() + 1
+    waiting_mine = queue.pending_for(chat_id) + 1
     await _safe_edit_or_send(
         app,
         chat_id,
@@ -436,7 +492,7 @@ async def _flush_chat_after_delay(chat_id: int, app: Application) -> None:
         (
             f"รับข้อความแล้ว {len(text):,} ตัวอักษร\n"
             f"จะแบ่งเป็น {len(parts)} ไฟล์ / ประมาณ {request_count} TTS requests\n"
-            f"เข้าคิวลำดับที่ {queue_position}"
+            f"เข้าคิวแล้ว — รออยู่ {waiting_total} งาน (ของห้องนี้ {waiting_mine})"
         ),
     )
     _ensure_worker(app)
