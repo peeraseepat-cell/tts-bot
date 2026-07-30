@@ -283,7 +283,12 @@ class LocalF5Engine:
             wav = tts.infer(ref_audio=voice.ref_wav, ref_text=voice.ref_text, gen_text=chunk,
                             step=self._step, cfg=self._cfg, speed=self._speed,
                             max_chars=LIB_MAX_CHARS)
-            pieces.append(np.asarray(wav, dtype="float32").squeeze())
+            arr = np.atleast_1d(np.asarray(wav, dtype="float32").squeeze())
+            if arr.size == 0:
+                # ก้อนที่มีเนื้อให้อ่านแต่ได้เสียงเปล่า = **คำหายเงียบ** ห้ามข้ามไปเฉยๆ
+                # (ก้อนที่ไม่มีอะไรให้อ่าน เช่น เส้นคั่น ถูก thai_text.plan คัดออกไปก่อนแล้ว)
+                raise EngineUnavailable(f"โมเดลคืนเสียงเปล่าให้ก้อน: {chunk[:40]!r}")
+            pieces.append(arr)
             if gap:
                 pieces.append(np.zeros(int(gap * self._sample_rate), dtype="float32"))
         arr = np.concatenate(pieces)

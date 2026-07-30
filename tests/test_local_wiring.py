@@ -4,6 +4,7 @@
 ทุกเทสต์ในไฟล์นี้ยิงด้วยเคสที่ต้องล้ม แล้วตรวจว่า **ล้มถูกทาง** ไม่ใช่ตรวจว่าเคสดีผ่าน
 """
 import asyncio
+import importlib.util
 import os
 import sys
 
@@ -186,3 +187,37 @@ def test_สำเนาที่สองยังไม่_drift_จากต�
     theirs, theirs_stat = chunk_th.plan(text, chunk_th.MAX)
     assert mine == theirs, "สำเนาที่สองเริ่ม drift จากต้นฉบับแล้ว"
     assert mine_stat == theirs_stat
+
+
+def test_เส้นคั่นและก้อนที่ไม่มีอะไรให้อ่านถูกคัดออกและถูกนับ():
+    """เจอจากบทความจริงของ Boommer — เส้นคั่น Markdown ทำให้ทั้ง job ระเบิด
+
+    โมเดลคืนเสียงเปล่าให้ก้อน '--------------------' แล้ว np.concatenate ล้มด้วย
+    "array at index 170 has 0 dimension(s)" ซึ่งอ่านไม่ออกเลยว่าต้นเหตุคืออะไร
+    """
+    items, stat = thai_text.plan("ประโยคแรก\n--------------------\nประโยคที่สอง\n***\nประโยคที่สาม")
+    assert stat["dropped_unspeakable"] == 2
+    assert stat["chunks"] == 3
+    assert all(thai_text.is_speakable(c) for c, _ in items)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("numpy") is None,
+                    reason="ต้องมี dependency ชุด local — venv แบบ Google-only ข้ามข้อนี้")
+def test_ก้อนที่มีเนื้อแต่ได้เสียงเปล่าต้องล้มดังไม่ใช่ข้ามเงียบ(monkeypatch):
+    """ข้ามก้อนเงียบๆ = คำหายโดยไม่มีใครรู้ — ตระกูลเดียวกับบั๊กที่ไล่มาทั้งวัน
+
+    เทสต์นี้ข้ามเองบนเครื่องที่ไม่มี numpy เพราะ engine จะล้มที่ด่าน dependency ก่อน
+    ซึ่ง **ถูกต้องแล้ว** — เป็นคนละด่านกัน ไม่ใช่ด่านนี้ล้มเหลว
+    """
+    import numpy as np
+
+    engine = engines.LocalF5Engine()
+
+    class FakeTTS:
+        def infer(self, **kw):
+            return np.array([])          # เสียงเปล่าจากก้อนที่มีเนื้อ
+
+    monkeypatch.setattr(engine, "_ensure_model", lambda: FakeTTS())
+    with pytest.raises(engines.EngineUnavailable) as exc:
+        asyncio.run(engine.synth_long("ประโยคไทยที่มีเนื้อหาให้อ่าน", voice(ref_wav=__file__)))
+    assert "เสียงเปล่า" in str(exc.value)

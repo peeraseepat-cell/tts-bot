@@ -315,13 +315,26 @@ def split_para(p: str, max_chars: int = MAX_CHUNK) -> list:
     return out
 
 
+_SPEAKABLE = re.compile(r"[\u0E00-\u0E7Fa-zA-Z0-9]")
+
+
+def is_speakable(chunk: str) -> bool:
+    """มีอะไรให้อ่านออกเสียงไหม — เส้นคั่น '-----' หรือ '***' ไม่มี
+
+    ทำไมต้องมี: บทความจริงของ Boommer มีเส้นคั่น Markdown อยู่กลางเรื่อง
+    ก้อนนั้นถูกส่งเข้าโมเดลแล้วได้ **เสียงเปล่า** ⇒ concat ระเบิดด้วย error ของ numpy
+    ที่อ่านไม่ออกว่าเกิดอะไร (array 0 มิติ) — เจอตอนยิงของจริง ไม่ใช่ตอนเทสต์
+    """
+    return bool(_SPEAKABLE.search(chunk))
+
+
 def plan(text: str, max_chars: int = MAX_CHUNK):
     """คืน ([(chunk, gap_after_sec)], สถิติ) — gap คือความเงียบที่เราคุมเอง"""
-    items, hard_cuts = [], 0
+    items, hard_cuts, dropped = [], 0, 0
     paras = paragraphs(text)
     if not paras:
         return [], {"paragraphs": 0, "chunks": 0, "hard_cuts": 0,
-                    "max_chunk": 0, "mean_chunk": 0.0}
+                    "max_chunk": 0, "mean_chunk": 0.0, "dropped_unspeakable": 0}
     for pi, p in enumerate(paras):
         chunks = split_para(p, max_chars)
         for ci, (c, hard) in enumerate(chunks):
@@ -329,8 +342,48 @@ def plan(text: str, max_chars: int = MAX_CHUNK):
             gap = GAP_PARA if last else GAP_MID
             if pi == len(paras) - 1 and last:
                 gap = 0.0                # ไม่ต้องมีความเงียบต่อท้ายไฟล์
+            if not is_speakable(c):
+                dropped += 1          # นับไว้รายงาน ห้ามทิ้งเงียบ
+                continue
             items.append((c, gap))
             hard_cuts += int(hard)
+    if not items:
+        return [], {"paragraphs": len(paras), "chunks": 0, "hard_cuts": 0,
+                    "max_chunk": 0, "mean_chunk": 0.0, "dropped_unspeakable": dropped}
     return items, {"paragraphs": len(paras), "chunks": len(items), "hard_cuts": hard_cuts,
                    "max_chunk": max(len(c) for c, _ in items),
-                   "mean_chunk": round(sum(len(c) for c, _ in items) / len(items), 1)}
+                   "mean_chunk": round(sum(len(c) for c, _ in items) / len(items), 1),
+                   "dropped_unspeakable": dropped}
+
+# ---- ชุดฟุตบอล/อาเซียน — เติมจากบทความจริงที่ Boommer ส่งมา 2026-07-30 ----
+# ยาวก่อนสั้นถูกจัดการโดย translit() อยู่แล้ว (sorted by len) จึงใส่วลียาวปนได้
+DICT.update({
+    "FIFA Asean": "ฟีฟ่า อาเซียน",
+    "Fifa Asean": "ฟีฟ่า อาเซียน",
+    "Arab Cup": "อาหรับ คัพ",
+    "Gulf Cup": "กัลฟ์ คัพ",
+    "Head to Head": "เฮด ทู เฮด",
+    "The best squad": "เดอะ เบสท์ สควอด",
+    "Transfer Window": "ทรานสเฟอร์ วินโดว์",
+    "AFF": "เอเอฟเอฟ",
+    "FIFA": "ฟีฟ่า",
+    "Fifa": "ฟีฟ่า",
+    "Asean": "อาเซียน",
+    "Final": "ไฟนอล",
+    "Window": "วินโดว์",
+    "Cup": "คัพ",
+    "The": "เดอะ",
+    "squad": "สควอด",
+    "success": "ซัคเซส",
+    "best": "เบสท์",
+    "pain point": "เพน พอยต์",
+    "pain": "เพน",
+    "point": "พอยต์",
+    "vs": "ปะทะ",
+    # ชุด A/B/C = ทีมชุดหนึ่ง/สอง/สาม — ตัวอักษรเดี่ยวต้องมี boundary ซึ่ง translit() ใส่ให้แล้ว
+    "A": "เอ",
+    "B": "บี",
+    "C": "ซี",
+    # "x5" = สัมประสิทธิ์คูณห้า — ตัว x ติดเลขจึงต้องแทนก่อนขั้นแปลงตัวเลข
+    "x": "คูณ",
+})
