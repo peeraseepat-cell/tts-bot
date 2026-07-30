@@ -109,8 +109,19 @@ class SynthesizeProgressTests(unittest.IsolatedAsyncioTestCase):
         )
         progress = []
 
+        # ต้องเป็น **เสียงจริง** ไม่ใช่ b"audio:251" — ตั้งแต่เส้น Google ผ่าน format contract
+        # bytes ที่ไม่ใช่เสียงจะถูกปฏิเสธ ซึ่งถูกต้องแล้ว: ของปลอมที่ไม่มีวันเป็นเสียงจริงได้
+        # เคยทำให้เทสต์นี้ "ผ่าน" ทั้งที่ไม่เคยตรวจว่า pipeline คืนเสียงที่เล่นได้จริงไหม
+        import subprocess
+
+        sample = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+             "-i", "sine=frequency=300:duration=0.3:sample_rate=24000",
+             "-ac", "1", "-c:a", "libmp3lame", "-f", "mp3", "pipe:1"],
+            capture_output=True, check=True).stdout
+
         async def fake_post_tts_chunk(_client, chunk):
-            return f"audio:{len(chunk)}".encode()
+            return sample
 
         async def on_progress(done, total):
             progress.append((done, total))

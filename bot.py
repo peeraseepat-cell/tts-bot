@@ -358,7 +358,19 @@ async def _synthesize_part(
             audio_parts.append(await _post_tts_chunk(client, chunk))
             used_chars += len(chunk)
             summary = USAGE_METER.record(len(chunk))
-    return b"".join(audio_parts), used_chars, len(chunks), summary
+
+    # 🔴 เส้นนี้คือเส้น **fallback** — ถ้าไม่ผ่าน format contract ช่องว่างความดัง 3.0 LU
+    # ระหว่าง F5 (-15.75 LUFS ดิบ) กับ Google (-18.72 LUFS ดิบ) จะกลับมาโผล่
+    # **ตรงจังหวะสลับ engine พอดี** ซึ่งเป็นจังหวะเดียวที่ contract มีไว้เพื่อมัน
+    # (contract ที่ติดอยู่บนถนนเส้นเดียวจากสองเส้น = ไม่ได้ครอบอะไรเลย)
+    #
+    # encode **ครั้งเดียวหลังต่อครบ** ไม่ใช่ทีละ chunk — LAME ใส่ padding หัวไฟล์ ~0.06 s ทุกครั้ง
+    # ที่ encode ⇒ encode ทีละ chunk จะได้ความเงียบสะสมตรงรอยต่อทุกจุด (วัดแล้วว่าคงที่ต่อครั้ง)
+    import audio_format
+
+    joined = b"".join(audio_parts)
+    encoded = await audio_format.encode(joined, audio_format.ENGINE_GAIN_DB["google"])
+    return encoded, used_chars, len(chunks), summary
 
 
 async def _synthesize(text: str) -> bytes:
