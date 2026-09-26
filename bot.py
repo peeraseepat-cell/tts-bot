@@ -99,7 +99,8 @@ class TTSJob:
 
 
 class GeminiQuotaError(Exception):
-    """429 from Gemini. kind is "minute" (retry later / smaller) or "day" (fall back to Chirp)."""
+    """429 from Gemini. kind: "tokens" (input tokens/min — the part is too big, halve it),
+    "minute" (requests/min or unknown — wait retry_delay, retry once), "day" (fall back to Chirp)."""
 
     def __init__(self, kind: str, retry_delay: Optional[float], message: str) -> None:
         super().__init__(message)
@@ -307,7 +308,7 @@ def _split_gemini_parts(text: str) -> list[str]:
 
 
 def _engine() -> str:
-    return "gemini" if GEMINI_API_KEY else "chirp"
+    return "gemini" if (GEMINI_API_KEY or "").strip() else "chirp"
 
 
 def _estimate_tts_requests(parts: list[str]) -> int:
@@ -408,8 +409,14 @@ async def _post_gemini(client: httpx.AsyncClient, text: str) -> bytes:
         },
     )
     if resp.status_code == 200:
-        part = next(p for p in resp.json()["candidates"][0]["content"]["parts"] if "inlineData" in p)
-        audio = base64.b64decode(part["inlineData"]["data"])
+        candidate = (resp.json().get("candidates") or [{}])[0]
+        finish = candidate.get("finishReason")
+        inline = next((p["inlineData"] for p in candidate.get("content", {}).get("parts", []) if "inlineData" in p), None)
+        if inline is None:
+            raise RuntimeError(f"Gemini TTS returned no audio (finishReason={finish})")
+        if finish != "STOP":
+            LOGGER.warning("Gemini TTS finishReason=%s — audio may be incomplete", finish)
+        audio = base64.b64decode(inline["data"])
         if audio[:4] == b"RIFF":            # 3.8 returns audio/wav with its own header
             return audio
         buf = io.BytesIO()                  # raw L16 (older models / streaming) → wrap once
@@ -429,45 +436,72 @@ async def _post_gemini(client: httpx.AsyncClient, text: str) -> bytes:
         for detail in error.get("details", []):
             quota_ids += [v.get("quotaId", "") for v in detail.get("violations", [])]
             delay = delay or _parse_retry_delay(detail.get("retryDelay"))
-        kind = "day" if any("PerDay" in q for q in quota_ids) else "minute"
+        if any("PerDay" in q for q in quota_ids):
+            kind = "day"
+        elif any("InputTokens" in q for q in quota_ids):
+            kind = "tokens"
+        else:
+            kind = "minute"
         raise GeminiQuotaError(kind, delay, error.get("message", "quota exceeded")[:200])
     raise RuntimeError(f"Gemini TTS {resp.status_code}: {error.get('message', '')[:200]}")
 
 
+MP3_SLICE_SECONDS = 30
+
+
 def _wav_to_mp3(wav_bytes: bytes) -> bytes:
+    """Encode in 30 s slices: feeding lameenc a whole 17-min part at once peaks at ~400 MB RSS."""
+    out = bytearray()
     with wave.open(io.BytesIO(wav_bytes), "rb") as w:
-        rate, channels, frames = w.getframerate(), w.getnchannels(), w.readframes(w.getnframes())
-    encoder = lameenc.Encoder()
-    encoder.set_bit_rate(GEMINI_MP3_KBPS)
-    encoder.set_in_sample_rate(rate)
-    encoder.set_channels(channels)
-    encoder.set_quality(2)
-    return bytes(encoder.encode(frames) + encoder.flush())
+        encoder = lameenc.Encoder()
+        encoder.set_bit_rate(GEMINI_MP3_KBPS)
+        encoder.set_in_sample_rate(w.getframerate())
+        encoder.set_channels(w.getnchannels())
+        encoder.set_quality(2)
+        slice_frames = w.getframerate() * MP3_SLICE_SECONDS
+        while True:
+            frames = w.readframes(slice_frames)
+            if not frames:
+                break
+            out += encoder.encode(frames)
+        out += encoder.flush()
+    return bytes(out)
 
 
 async def _gemini_segments(client: httpx.AsyncClient, text: str, pacer: GeminiPacer) -> tuple[list[bytes], int]:
+    """Returns MP3 segments. Each WAV is encoded (off the event loop) as soon as it arrives, so
+    at most one part's WAV is held in memory at a time."""
     await pacer.wait()
     try:
-        return [await _post_gemini(client, text)], 1
+        wav = await _post_gemini(client, text)
+        requests = 1
     except GeminiQuotaError as exc:
-        # A part counted over the per-minute input budget can never pass at its size — halve it.
-        # A day-quota 429 propagates so the job can fall back to Chirp.
-        if exc.kind != "minute" or len(text) < GEMINI_MIN_SPLIT * 2:
+        if exc.kind == "minute":
+            # Requests/min or unknown per-minute limit: same size will pass after the delay.
+            await pacer._sleep(exc.retry_delay or pacer.min_interval)
+            wav = await _post_gemini(client, text)
+            requests = 2
+        elif exc.kind == "tokens" and len(text) >= GEMINI_MIN_SPLIT * 2:
+            # Counted over the input-token budget: this size can never pass — halve it.
+            LOGGER.warning("Gemini input-token quota on %d chars — splitting in half", len(text))
+            mp3s, requests = [], 1
+            for half in _split_text(text, len(text) // 2):
+                half_mp3s, half_requests = await _gemini_segments(client, half, pacer)
+                mp3s += half_mp3s
+                requests += half_requests
+            return mp3s, requests
+        else:
             raise
-        LOGGER.warning("Gemini minute quota on %d chars — splitting in half", len(text))
-        wavs, requests = [], 1
-        for half in _split_text(text, len(text) // 2):
-            half_wavs, half_requests = await _gemini_segments(client, half, pacer)
-            wavs += half_wavs
-            requests += half_requests
-        return wavs, requests
+    mp3 = await asyncio.to_thread(_wav_to_mp3, wav)
+    del wav
+    return [mp3], requests
 
 
 async def _synthesize_gemini_part(text: str, pacer: GeminiPacer) -> tuple[bytes, int]:
     timeout = httpx.Timeout(GEMINI_READ_TIMEOUT, connect=TTS_CONNECT_TIMEOUT)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        wavs, requests = await _gemini_segments(client, text, pacer)
-    return b"".join(_wav_to_mp3(w) for w in wavs), requests
+        mp3s, requests = await _gemini_segments(client, text, pacer)
+    return b"".join(mp3s), requests
 
 
 async def _synthesize_part(
@@ -631,19 +665,18 @@ async def _process_job(app: Application, job: TTSJob) -> None:
             if engine == "gemini":
                 try:
                     audio_bytes, requests = await _synthesize_gemini_part(part, GEMINI_PACER)
-                except GeminiQuotaError as exc:
-                    if exc.kind != "day":
-                        raise
-                    # Daily quota gone: the rest of THIS article goes to Chirp, re-split for Chirp's limits.
+                except Exception as exc:
+                    # Any Gemini failure (daily quota, 5xx, timeout, no audio): the rest of THIS article
+                    # goes to Chirp, re-split for Chirp's limits. Told in its own message — a status
+                    # edit would be overwritten by the next progress update.
+                    LOGGER.warning("Gemini failed on file %s/%s (%s: %s) — Chirp for the rest", index, len(parts), type(exc).__name__, exc)
+                    reason = "โควตา Gemini วันนี้หมดแล้ว" if isinstance(exc, GeminiQuotaError) and exc.kind == "day" \
+                        else f"Gemini ใช้ไม่ได้ ({type(exc).__name__}: {str(exc)[:120] or 'no detail'})"
                     engine = "chirp"
                     parts = parts[: index - 1] + _split_output_parts("\n\n".join(parts[index - 1:]))
                     index -= 1
-                    await _safe_edit_or_send(
-                        app,
-                        job.chat_id,
-                        job.status_message_id,
-                        "โควตา Gemini วันนี้หมดแล้ว — ไฟล์ที่เหลือใช้เสียง Chirp แทน",
-                    )
+                    with contextlib.suppress(Exception):
+                        await app.bot.send_message(chat_id=job.chat_id, text=f"{reason} — ไฟล์ที่เหลือใช้เสียง Chirp แทน")
                     continue
                 used_chars = len(part)
                 summary = USAGE_METER.record(used_chars)
