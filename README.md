@@ -72,7 +72,11 @@ All configuration is via environment variables. Only the first two are required.
 | `TELEGRAM_BOT_TOKEN` | ✅ | — | Bot token from [@BotFather](https://t.me/BotFather) |
 | `GOOGLE_API_KEY` | ✅ | — | Google Cloud API key with Text-to-Speech enabled |
 | `ALLOWED_CHAT_IDS` | | — (everyone) | Comma-separated chat IDs allowed to use the bot; others are silently ignored. Get yours from [@userinfobot](https://t.me/userinfobot) |
-| `TTS_VOICE` | | `th-TH-Chirp3-HD-Achernar` | Any Google Cloud TTS voice name |
+| `GEMINI_API_KEY` | | — | Google AI Studio key. When set, narration uses Gemini TTS and Chirp becomes the fallback for when the Gemini daily quota runs out |
+| `GEMINI_TTS_MODEL` | | `gemini-3.8-flash-tts` | Gemini TTS model (Thai needs Flash TTS; Flash-Lite TTS has no Thai) |
+| `TTS_VOICE_GEMINI` | | `Aoede` | Gemini prebuilt voice name |
+| `GEMINI_PART_SIZE` | | `14000` | Characters per Gemini request / audio file. The free tier counts ~2× prompt tokens against 10K input tokens/min; 14k Thai chars ≈ 9.2K |
+| `TTS_VOICE` | | `th-TH-Chirp3-HD-Achernar` | Any Google Cloud TTS voice name (Chirp) |
 | `SUPABASE_URL` / `SUPABASE_KEY` | | — | Enables persistent per-user usage metering |
 | `TTS_MONTHLY_FREE_CHARS` | | `1000000` | Monthly character quota per user |
 | `COLLECT_WINDOW_SECONDS` | | `5` | How long to wait for follow-up messages before narrating |

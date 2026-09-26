@@ -7,12 +7,14 @@ import logging
 import math
 import os
 import time
+import wave
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Optional
 from zoneinfo import ZoneInfo
 
 import httpx
+import lameenc
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
@@ -40,6 +42,19 @@ TTS_READ_TIMEOUT = float(os.environ.get("TTS_READ_TIMEOUT", 15))
 TTS_FILE_TIMEOUT = float(os.environ.get("TTS_FILE_TIMEOUT", 60))
 TELEGRAM_SEND_TIMEOUT = float(os.environ.get("TELEGRAM_SEND_TIMEOUT", 90))
 PORT = int(os.environ.get("PORT", 8443))
+
+# Gemini TTS — used whenever GEMINI_API_KEY is set; Chirp stays as the fallback.
+# Free tier: 3 RPM · 10K input tokens/min (counted ~2× promptTokenCount) · 10 RPD.
+# A 14,000-char Thai part ≈ 4,600 prompt tokens ≈ 9.2K counted — one part per minute fits.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
+GEMINI_VOICE = os.environ.get("TTS_VOICE_GEMINI", "Aoede")
+GEMINI_PART_SIZE = int(os.environ.get("GEMINI_PART_SIZE", 14000))
+GEMINI_MIN_INTERVAL = float(os.environ.get("GEMINI_MIN_INTERVAL", 60))
+GEMINI_READ_TIMEOUT = float(os.environ.get("GEMINI_READ_TIMEOUT", 180))
+GEMINI_MP3_KBPS = int(os.environ.get("GEMINI_MP3_KBPS", 48))
+GEMINI_MIN_SPLIT = 500
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 
 def _parse_allowed_chat_ids(raw: str) -> frozenset[int]:
@@ -80,6 +95,35 @@ class TTSJob:
     text: str
     parts: list[str]
     queued_at: datetime
+    engine: str = "chirp"
+
+
+class GeminiQuotaError(Exception):
+    """429 from Gemini. kind: "tokens" (input tokens/min — the part is too big, halve it),
+    "minute" (requests/min or unknown — wait retry_delay, retry once), "day" (fall back to Chirp)."""
+
+    def __init__(self, kind: str, retry_delay: Optional[float], message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.retry_delay = retry_delay
+
+
+class GeminiPacer:
+    """Keeps at least min_interval seconds between Gemini requests (covers RPM and input TPM)."""
+
+    def __init__(self, min_interval: float, clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> None:
+        self.min_interval = min_interval
+        self._clock = clock
+        self._sleep = sleep
+        self._last: Optional[float] = None
+
+    async def wait(self) -> None:
+        if self._last is not None:
+            remaining = self.min_interval - (self._clock() - self._last)
+            if remaining > 0:
+                await self._sleep(remaining)
+        self._last = self._clock()
 
 
 class UsageMeter:
@@ -207,6 +251,7 @@ USAGE_METER = UsageMeter(MONTHLY_FREE_CHARS, USAGE_TIMEZONE)
 PENDING_BUFFERS: dict[int, PendingChatBuffer] = {}
 JOB_QUEUE: Optional[asyncio.Queue] = None
 WORKER_TASK: Optional[asyncio.Task] = None
+GEMINI_PACER = GeminiPacer(GEMINI_MIN_INTERVAL)
 
 
 def _ensure_sentence_ending(chunk: str) -> str:
@@ -216,20 +261,20 @@ def _ensure_sentence_ending(chunk: str) -> str:
     return chunk.rstrip(SOFT_ENDINGS) + "."
 
 
-def _split_text(text: str) -> list[str]:
+def _split_text(text: str, size: int = CHUNK_SIZE) -> list[str]:
     text = text.strip()
-    if len(text) <= CHUNK_SIZE + 1:
+    if len(text) <= size + 1:
         return [_ensure_sentence_ending(text)]
     chunks = []
     while text:
-        if len(text) <= CHUNK_SIZE + 1:
+        if len(text) <= size + 1:
             chunks.append(_ensure_sentence_ending(text))
             break
-        cut = CHUNK_SIZE
-        search_limit = CHUNK_SIZE + 1
+        cut = size
+        search_limit = size + 1
         for sep in ["\n", ". ", "! ", "? ", "。", "…", ".", "!", "?", ", ", " "]:
             pos = text.rfind(sep, 0, search_limit)
-            if pos > CHUNK_SIZE // 2:
+            if pos > size // 2:
                 cut = pos + len(sep)
                 break
         chunks.append(_ensure_sentence_ending(text[:cut]))
@@ -258,6 +303,14 @@ def _split_output_parts(text: str) -> list[str]:
     return parts
 
 
+def _split_gemini_parts(text: str) -> list[str]:
+    return _split_text(text, GEMINI_PART_SIZE)
+
+
+def _engine() -> str:
+    return "gemini" if (GEMINI_API_KEY or "").strip() else "chirp"
+
+
 def _estimate_tts_requests(parts: list[str]) -> int:
     return sum(len(_split_text(part)) for part in parts)
 
@@ -274,6 +327,7 @@ def _format_usage_summary(summary: UsageSummary, used_this_job: int, requests: i
 def _format_runtime_status(summary: UsageSummary) -> str:
     return (
         "TTS bot status\n"
+        f"engine: {_engine()}" + (f" ({GEMINI_MODEL} · {GEMINI_VOICE})" if _engine() == "gemini" else "") + "\n"
         f"collect window: {COLLECT_WINDOW_SECONDS:g}s\n"
         f"part max chunks: {TTS_PART_MAX_CHUNKS}\n"
         f"TTS read timeout: {TTS_READ_TIMEOUT:g}s\n"
@@ -332,6 +386,122 @@ async def _post_tts_chunk(client: httpx.AsyncClient, chunk: str) -> bytes:
         raise RuntimeError(f"Google TTS: {err}")
 
     raise RuntimeError("Google TTS failed")
+
+
+def _parse_retry_delay(raw: Optional[str]) -> Optional[float]:
+    try:
+        return float(str(raw).rstrip("s")) if raw else None
+    except ValueError:
+        return None
+
+
+async def _post_gemini(client: httpx.AsyncClient, text: str) -> bytes:
+    """One generateContent call. Returns WAV bytes. Never calls countTokens (it spends the TPM quota)."""
+    resp = await client.post(
+        GEMINI_URL.format(model=GEMINI_MODEL),
+        headers={"x-goog-api-key": GEMINI_API_KEY or ""},
+        json={
+            "contents": [{"parts": [{"text": text}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": GEMINI_VOICE}}},
+            },
+        },
+    )
+    if resp.status_code == 200:
+        candidate = (resp.json().get("candidates") or [{}])[0]
+        finish = candidate.get("finishReason")
+        inline = next((p["inlineData"] for p in candidate.get("content", {}).get("parts", []) if "inlineData" in p), None)
+        if inline is None:
+            raise RuntimeError(f"Gemini TTS returned no audio (finishReason={finish})")
+        if finish != "STOP":
+            LOGGER.warning("Gemini TTS finishReason=%s — audio may be incomplete", finish)
+        audio = base64.b64decode(inline["data"])
+        if audio[:4] == b"RIFF":            # 3.8 returns audio/wav with its own header
+            return audio
+        buf = io.BytesIO()                  # raw L16 (older models / streaming) → wrap once
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(24000)
+            w.writeframes(audio)
+        return buf.getvalue()
+
+    try:
+        error = resp.json().get("error", {})
+    except ValueError:
+        error = {"message": resp.text[:200]}
+    if resp.status_code == 429:
+        quota_ids, delay = [], None
+        for detail in error.get("details", []):
+            quota_ids += [v.get("quotaId", "") for v in detail.get("violations", [])]
+            delay = delay or _parse_retry_delay(detail.get("retryDelay"))
+        if any("PerDay" in q for q in quota_ids):
+            kind = "day"
+        elif any("InputTokens" in q for q in quota_ids):
+            kind = "tokens"
+        else:
+            kind = "minute"
+        raise GeminiQuotaError(kind, delay, error.get("message", "quota exceeded")[:200])
+    raise RuntimeError(f"Gemini TTS {resp.status_code}: {error.get('message', '')[:200]}")
+
+
+MP3_SLICE_SECONDS = 30
+
+
+def _wav_to_mp3(wav_bytes: bytes) -> bytes:
+    """Encode in 30 s slices: feeding lameenc a whole 17-min part at once peaks at ~400 MB RSS."""
+    out = bytearray()
+    with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+        encoder = lameenc.Encoder()
+        encoder.set_bit_rate(GEMINI_MP3_KBPS)
+        encoder.set_in_sample_rate(w.getframerate())
+        encoder.set_channels(w.getnchannels())
+        encoder.set_quality(2)
+        slice_frames = w.getframerate() * MP3_SLICE_SECONDS
+        while True:
+            frames = w.readframes(slice_frames)
+            if not frames:
+                break
+            out += encoder.encode(frames)
+        out += encoder.flush()
+    return bytes(out)
+
+
+async def _gemini_segments(client: httpx.AsyncClient, text: str, pacer: GeminiPacer) -> tuple[list[bytes], int]:
+    """Returns MP3 segments. Each WAV is encoded (off the event loop) as soon as it arrives, so
+    at most one part's WAV is held in memory at a time."""
+    await pacer.wait()
+    try:
+        wav = await _post_gemini(client, text)
+        requests = 1
+    except GeminiQuotaError as exc:
+        if exc.kind == "minute":
+            # Requests/min or unknown per-minute limit: same size will pass after the delay.
+            await pacer._sleep(exc.retry_delay or pacer.min_interval)
+            wav = await _post_gemini(client, text)
+            requests = 2
+        elif exc.kind == "tokens" and len(text) >= GEMINI_MIN_SPLIT * 2:
+            # Counted over the input-token budget: this size can never pass — halve it.
+            LOGGER.warning("Gemini input-token quota on %d chars — splitting in half", len(text))
+            mp3s, requests = [], 1
+            for half in _split_text(text, len(text) // 2):
+                half_mp3s, half_requests = await _gemini_segments(client, half, pacer)
+                mp3s += half_mp3s
+                requests += half_requests
+            return mp3s, requests
+        else:
+            raise
+    mp3 = await asyncio.to_thread(_wav_to_mp3, wav)
+    del wav
+    return [mp3], requests
+
+
+async def _synthesize_gemini_part(text: str, pacer: GeminiPacer) -> tuple[bytes, int]:
+    timeout = httpx.Timeout(GEMINI_READ_TIMEOUT, connect=TTS_CONNECT_TIMEOUT)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        mp3s, requests = await _gemini_segments(client, text, pacer)
+    return b"".join(mp3s), requests
 
 
 async def _synthesize_part(
@@ -425,8 +595,13 @@ async def _flush_chat_after_delay(chat_id: int, app: Application) -> None:
         )
         return
 
-    parts = _split_output_parts(text)
-    request_count = _estimate_tts_requests(parts)
+    engine = _engine()
+    if engine == "gemini":
+        parts = _split_gemini_parts(text)
+        request_count = len(parts)
+    else:
+        parts = _split_output_parts(text)
+        request_count = _estimate_tts_requests(parts)
     queue = _get_queue()
     queue_position = queue.qsize() + 1
     await _safe_edit_or_send(
@@ -446,6 +621,7 @@ async def _flush_chat_after_delay(chat_id: int, app: Application) -> None:
         text=text,
         parts=parts,
         queued_at=datetime.now(ZoneInfo(USAGE_TIMEZONE)),
+        engine=engine,
     ))
 
 
@@ -471,47 +647,71 @@ async def _process_job(app: Application, job: TTSJob) -> None:
     total_used = 0
     total_requests = 0
     summary = USAGE_METER.preview()
+    parts = list(job.parts)
+    engine = job.engine
 
-    for index, part in enumerate(job.parts, start=1):
-        LOGGER.info("Processing TTS file %s/%s chars=%s", index, len(job.parts), len(part))
+    index = 0
+    while index < len(parts):
+        part = parts[index]
+        index += 1
+        LOGGER.info("Processing TTS file %s/%s chars=%s engine=%s", index, len(parts), len(part), engine)
         await _safe_edit_or_send(
             app,
             job.chat_id,
             job.status_message_id,
-            f"กำลังสร้างเสียงไฟล์ {index}/{len(job.parts)}...",
+            f"กำลังสร้างเสียงไฟล์ {index}/{len(parts)}...",
         )
         try:
-            async def report_progress(done: int, total: int) -> None:
-                _fire_and_forget_edit(
-                    app,
-                    job.chat_id,
-                    job.status_message_id,
-                    f"กำลังสร้างเสียงไฟล์ {index}/{len(job.parts)} · ท่อน {done}/{total}...",
-                )
+            if engine == "gemini":
+                try:
+                    audio_bytes, requests = await _synthesize_gemini_part(part, GEMINI_PACER)
+                except Exception as exc:
+                    # Any Gemini failure (daily quota, 5xx, timeout, no audio): the rest of THIS article
+                    # goes to Chirp, re-split for Chirp's limits. Told in its own message — a status
+                    # edit would be overwritten by the next progress update.
+                    LOGGER.warning("Gemini failed on file %s/%s (%s: %s) — Chirp for the rest", index, len(parts), type(exc).__name__, exc)
+                    reason = "โควตา Gemini วันนี้หมดแล้ว" if isinstance(exc, GeminiQuotaError) and exc.kind == "day" \
+                        else f"Gemini ใช้ไม่ได้ ({type(exc).__name__}: {str(exc)[:120] or 'no detail'})"
+                    engine = "chirp"
+                    parts = parts[: index - 1] + _split_output_parts("\n\n".join(parts[index - 1:]))
+                    index -= 1
+                    with contextlib.suppress(Exception):
+                        await app.bot.send_message(chat_id=job.chat_id, text=f"{reason} — ไฟล์ที่เหลือใช้เสียง Chirp แทน")
+                    continue
+                used_chars = len(part)
+                summary = USAGE_METER.record(used_chars)
+            else:
+                async def report_progress(done: int, total: int) -> None:
+                    _fire_and_forget_edit(
+                        app,
+                        job.chat_id,
+                        job.status_message_id,
+                        f"กำลังสร้างเสียงไฟล์ {index}/{len(parts)} · ท่อน {done}/{total}...",
+                    )
 
-            audio_bytes, used_chars, requests, summary = await _synthesize_part_with_timeout(
-                part,
-                progress=report_progress,
-            )
+                audio_bytes, used_chars, requests, summary = await _synthesize_part_with_timeout(
+                    part,
+                    progress=report_progress,
+                )
         except Exception as exc:
             await _safe_edit_or_send(
                 app,
                 job.chat_id,
                 job.status_message_id,
-                f"เกิดข้อผิดพลาดตอนสร้างไฟล์ {index}/{len(job.parts)}: {exc}",
+                f"เกิดข้อผิดพลาดตอนสร้างไฟล์ {index}/{len(parts)}: {exc}",
             )
             return
 
         total_used += used_chars
         total_requests += requests
         voice = io.BytesIO(audio_bytes)
-        voice.name = f"tts_part_{index:02d}_of_{len(job.parts):02d}.mp3"
+        voice.name = f"tts_part_{index:02d}_of_{len(parts):02d}.mp3"
         voice_size = len(audio_bytes)
         _fire_and_forget_edit(
             app,
             job.chat_id,
             job.status_message_id,
-            f"สร้างเสียงไฟล์ {index}/{len(job.parts)} เสร็จแล้ว กำลังส่งเข้า Telegram...",
+            f"สร้างเสียงไฟล์ {index}/{len(parts)} เสร็จแล้ว กำลังส่งเข้า Telegram...",
         )
         try:
             send_start = time.monotonic()
@@ -519,18 +719,18 @@ async def _process_job(app: Application, job: TTSJob) -> None:
                 app=app,
                 chat_id=job.chat_id,
                 voice=voice,
-                caption=f"ไฟล์ {index}/{len(job.parts)} · {len(part):,} ตัวอักษร",
+                caption=f"ไฟล์ {index}/{len(parts)} · {len(part):,} ตัวอักษร",
             )
             send_ms = int((time.monotonic() - send_start) * 1000)
-            LOGGER.info("Sent voice file %s/%s size=%d elapsed=%dms", index, len(job.parts), voice_size, send_ms)
+            LOGGER.info("Sent voice file %s/%s size=%d elapsed=%dms", index, len(parts), voice_size, send_ms)
         except Exception as exc:
             send_ms = int((time.monotonic() - send_start) * 1000)
-            LOGGER.error("Failed voice file %s/%s size=%d elapsed=%dms err=%s", index, len(job.parts), voice_size, send_ms, exc)
+            LOGGER.error("Failed voice file %s/%s size=%d elapsed=%dms err=%s", index, len(parts), voice_size, send_ms, exc)
             await _safe_edit_or_send(
                 app,
                 job.chat_id,
                 job.status_message_id,
-                f"เกิดข้อผิดพลาดตอนส่งไฟล์ {index}/{len(job.parts)} เข้า Telegram: {exc}",
+                f"เกิดข้อผิดพลาดตอนส่งไฟล์ {index}/{len(parts)} เข้า Telegram: {exc}",
             )
             return
 
@@ -540,7 +740,6 @@ async def _process_job(app: Application, job: TTSJob) -> None:
         job.status_message_id,
         "เสร็จแล้ว\n" + _format_usage_summary(summary, total_used, total_requests),
     )
-
 
 def _is_allowed_chat(chat_id: int) -> bool:
     if not ALLOWED_CHAT_IDS:
