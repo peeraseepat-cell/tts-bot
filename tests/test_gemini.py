@@ -84,7 +84,7 @@ class PostGeminiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("countTokens", str(seen[0].url))
         body = json.loads(seen[0].content)
         voice = body["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"]
-        self.assertEqual(voice, bot.GEMINI_VOICE)
+        self.assertEqual(voice, bot.PERSONA_BY_KEY[bot.DEFAULT_PERSONA].voice)
         self.assertEqual(body["generationConfig"]["responseModalities"], ["AUDIO"])
 
     async def test_429_per_minute_raises_tpm_with_retry_delay(self):
@@ -177,7 +177,7 @@ class SliceEncodeTests(unittest.TestCase):
 
 class SegmentAudioTests(unittest.IsolatedAsyncioTestCase):
     async def test_every_half_contributes_its_audio_in_order(self):
-        async def fake_post(_client, text):
+        async def fake_post(_client, text, persona=None):
             if len(text) > 3000:
                 raise bot.GeminiQuotaError("tokens", 30.0, "tpm")
             return f"WAV{len(text)}".encode()
@@ -195,7 +195,7 @@ class SegmentAudioTests(unittest.IsolatedAsyncioTestCase):
     async def test_short_part_is_not_halved_on_token_quota(self):
         calls = []
 
-        async def fake_post(_client, text):
+        async def fake_post(_client, text, persona=None):
             calls.append(text)
             raise bot.GeminiQuotaError("tokens", 30.0, "tpm")
 
@@ -212,7 +212,7 @@ class SegmentAudioTests(unittest.IsolatedAsyncioTestCase):
             slept.append(s)
             now[0] += s
 
-        async def fake_post(_client, text):
+        async def fake_post(_client, text, persona=None):
             now[0] += 1
             if len(text) > 3000:
                 raise bot.GeminiQuotaError("tokens", 30.0, "tpm")
@@ -227,7 +227,7 @@ class SegmentAudioTests(unittest.IsolatedAsyncioTestCase):
     async def test_minute_429_waits_retry_delay_and_retries_same_size(self):
         calls, slept = [], []
 
-        async def fake_post(_client, text):
+        async def fake_post(_client, text, persona=None):
             calls.append(len(text))
             if len(calls) == 1:
                 raise bot.GeminiQuotaError("minute", 12.0, "rpm")
@@ -252,7 +252,7 @@ class SegmentAudioTests(unittest.IsolatedAsyncioTestCase):
             seen.append(func.__name__)
             return await real_to_thread(func, *args)
 
-        async def fake_post(_client, text):
+        async def fake_post(_client, text, persona=None):
             return _wav(0.2)
 
         pacer = bot.GeminiPacer(min_interval=0, clock=lambda: 0.0, sleep=mock.AsyncMock())
@@ -291,7 +291,7 @@ class SynthesizeGeminiPartTests(unittest.IsolatedAsyncioTestCase):
     async def test_minute_quota_halves_the_part_and_joins_audio(self):
         calls = []
 
-        async def fake_post(_client, text):
+        async def fake_post(_client, text, persona=None):
             calls.append(len(text))
             if len(text) > 3000:
                 raise bot.GeminiQuotaError("tokens", 30.0, "tpm")
@@ -309,7 +309,7 @@ class SynthesizeGeminiPartTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mp3[0], 0xFF)
 
     async def test_day_quota_propagates(self):
-        async def fake_post(_client, text):
+        async def fake_post(_client, text, persona=None):
             raise bot.GeminiQuotaError("day", None, "rpd")
 
         pacer = bot.GeminiPacer(min_interval=0, clock=lambda: 0.0, sleep=mock.AsyncMock())
@@ -341,7 +341,7 @@ class ProcessJobGeminiTests(unittest.IsolatedAsyncioTestCase):
     async def test_gemini_job_sends_one_mp3_per_part(self):
         app, sent, _ = self._fake_app()
 
-        async def fake_gem(part, pacer):
+        async def fake_gem(part, pacer, persona=None):
             return b"\xff\xfb\x90" + b"\x00" * 10, 1
 
         job = bot.TTSJob(chat_id=1, status_message_id=2, text="a b", parts=["ส่วนหนึ่ง", "ส่วนสอง"],
@@ -357,7 +357,7 @@ class ProcessJobGeminiTests(unittest.IsolatedAsyncioTestCase):
         app, sent, messages = self._fake_app()
         gem_calls, chirp_calls = [], []
 
-        async def fake_gem(part, pacer):
+        async def fake_gem(part, pacer, persona=None):
             gem_calls.append(part)
             if len(gem_calls) == 2:
                 raise bot.GeminiQuotaError("day", None, "rpd")
@@ -403,7 +403,7 @@ class GeminiFailureFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def _run(self, error):
         app, edits, sends, voices = self._app()
 
-        async def fake_gem(part, pacer):
+        async def fake_gem(part, pacer, persona=None):
             raise error
 
         async def fake_chirp(part, progress=None):
@@ -438,7 +438,7 @@ class ChirpFallbackSizeTests(unittest.IsolatedAsyncioTestCase):
         app, sent, messages = self._fake_app()
         chirp_parts = []
 
-        async def fake_gem(part, pacer):
+        async def fake_gem(part, pacer, persona=None):
             raise bot.GeminiQuotaError("day", None, "rpd")
 
         async def fake_chirp(part, progress=None):

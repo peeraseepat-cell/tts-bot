@@ -6,6 +6,8 @@ import io
 import logging
 import math
 import os
+import random
+import re
 import time
 import wave
 from dataclasses import dataclass, field
@@ -15,8 +17,8 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import lameenc
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 try:
     from supabase import create_client
@@ -48,7 +50,6 @@ PORT = int(os.environ.get("PORT", 8443))
 # A 14,000-char Thai part ≈ 4,600 prompt tokens ≈ 9.2K counted — one part per minute fits.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
-GEMINI_VOICE = os.environ.get("TTS_VOICE_GEMINI", "Aoede")
 GEMINI_PART_SIZE = int(os.environ.get("GEMINI_PART_SIZE", 14000))
 GEMINI_MIN_INTERVAL = float(os.environ.get("GEMINI_MIN_INTERVAL", 60))
 GEMINI_READ_TIMEOUT = float(os.environ.get("GEMINI_READ_TIMEOUT", 180))
@@ -88,6 +89,29 @@ class PendingChatBuffer:
     flush_task: Optional[asyncio.Task] = None
 
 
+@dataclass(frozen=True)
+class Persona:
+    key: str
+    name: str
+    voice: str
+    style: str
+
+
+# Voice + style pairs chosen by Boommer in AI Studio Playground (2026-09-26). The style goes in
+# the request's speechMetadata.style, exactly as Playground "Get code" sends it.
+BROADCAST_STYLE = "Style: Professional, authoritative, clear articulation with standard broadcast cadence."
+PERSONAS = [
+    Persona("jan", "น้องแจน", "Sami", BROADCAST_STYLE),
+    Persona("tom", "คุณทอม", "Achird", BROADCAST_STYLE),
+    Persona("leng", "ป้าเล้ง", "Kore", BROADCAST_STYLE),
+    Persona("dak", "พี่แด๊ก", "Algenib", BROADCAST_STYLE),
+]
+PERSONA_BY_KEY = {p.key: p for p in PERSONAS}
+RANDOM_PERSONA = "random"
+DEFAULT_PERSONA = os.environ.get("TTS_PERSONA", "jan") if os.environ.get("TTS_PERSONA", "jan") in PERSONA_BY_KEY else "jan"
+PERSONA_TAG_RE = re.compile(r"#persona=(\w+)")
+
+
 @dataclass
 class TTSJob:
     chat_id: int
@@ -96,6 +120,7 @@ class TTSJob:
     parts: list[str]
     queued_at: datetime
     engine: str = "chirp"
+    persona: str = DEFAULT_PERSONA
 
 
 class GeminiQuotaError(Exception):
@@ -252,6 +277,84 @@ PENDING_BUFFERS: dict[int, PendingChatBuffer] = {}
 JOB_QUEUE: Optional[asyncio.Queue] = None
 WORKER_TASK: Optional[asyncio.Task] = None
 GEMINI_PACER = GeminiPacer(GEMINI_MIN_INTERVAL)
+CHAT_PERSONA: dict[int, str] = {}         # chat → saved choice (a persona key or "random")
+SETTINGS_MESSAGE_ID: dict[int, int] = {}  # chat → the bot's pinned settings message
+
+
+def _resolve_persona(key: str, choice: Optional[Callable[[list[str]], str]] = None) -> str:
+    if key == RANDOM_PERSONA:
+        return (choice or random.choice)([p.key for p in PERSONAS])
+    return key if key in PERSONA_BY_KEY else DEFAULT_PERSONA
+
+
+def _persona_label(key: str) -> str:
+    if key == RANDOM_PERSONA:
+        return "🎲 สุ่ม"
+    p = PERSONA_BY_KEY[key]
+    return f"{p.name} ({p.voice})"
+
+
+def _persona_tag(key: str) -> str:
+    return f"⚙️ ผู้อ่าน: {_persona_label(key)}\n#persona={key}"
+
+
+def _parse_pinned_persona(message: Any, bot_id: int) -> Optional[str]:
+    """The saved choice lives in a message the bot pinned. Trust only the bot's own tagged pin."""
+    text = getattr(message, "text", None)
+    author = getattr(message, "from_user", None)
+    if not text or author is None or author.id != bot_id:
+        return None
+    match = PERSONA_TAG_RE.search(text)
+    key = match.group(1) if match else None
+    return key if key in PERSONA_BY_KEY or key == RANDOM_PERSONA else None
+
+
+def _settings_keyboard(current: str) -> InlineKeyboardMarkup:
+    keys = [p.key for p in PERSONAS] + [RANDOM_PERSONA]
+    buttons = [
+        InlineKeyboardButton(("✓ " if key == current else "") + _persona_label(key), callback_data=f"persona:{key}")
+        for key in keys
+    ]
+    return InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)])
+
+
+async def _get_chat_persona(app: Application, chat_id: int) -> str:
+    """Saved choice for this chat. Survives restarts through the pinned settings message
+    (no database): read once per process, then cached. Any failure → the default."""
+    if chat_id in CHAT_PERSONA:
+        return CHAT_PERSONA[chat_id]
+    key = DEFAULT_PERSONA
+    try:
+        chat = await app.bot.get_chat(chat_id)
+        pinned = getattr(chat, "pinned_message", None)
+        parsed = _parse_pinned_persona(pinned, app.bot.id)
+        if parsed:
+            key = parsed
+            SETTINGS_MESSAGE_ID[chat_id] = pinned.message_id
+    except Exception as exc:
+        LOGGER.warning("Could not read pinned persona for chat %s: %s", chat_id, exc)
+    CHAT_PERSONA[chat_id] = key
+    return key
+
+
+async def _save_chat_persona(app: Application, chat_id: int, key: str) -> None:
+    CHAT_PERSONA[chat_id] = key
+    text = _persona_tag(key)
+    message_id = SETTINGS_MESSAGE_ID.get(chat_id)
+    if message_id is not None:
+        try:
+            await app.bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id)
+            return
+        except Exception as exc:
+            if "not modified" in str(exc).lower():
+                return
+            LOGGER.warning("Pinned persona edit failed (%s) — pinning a new one", exc)
+    try:
+        sent = await app.bot.send_message(chat_id=chat_id, text=text)
+        await app.bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id, disable_notification=True)
+        SETTINGS_MESSAGE_ID[chat_id] = sent.message_id
+    except Exception as exc:
+        LOGGER.warning("Persona for chat %s not persisted (kept in memory only): %s", chat_id, exc)
 
 
 def _ensure_sentence_ending(chunk: str) -> str:
@@ -327,7 +430,7 @@ def _format_usage_summary(summary: UsageSummary, used_this_job: int, requests: i
 def _format_runtime_status(summary: UsageSummary) -> str:
     return (
         "TTS bot status\n"
-        f"engine: {_engine()}" + (f" ({GEMINI_MODEL} · {GEMINI_VOICE})" if _engine() == "gemini" else "") + "\n"
+        f"engine: {_engine()}" + (f" ({GEMINI_MODEL})" if _engine() == "gemini" else "") + "\n"
         f"collect window: {COLLECT_WINDOW_SECONDS:g}s\n"
         f"part max chunks: {TTS_PART_MAX_CHUNKS}\n"
         f"TTS read timeout: {TTS_READ_TIMEOUT:g}s\n"
@@ -395,16 +498,21 @@ def _parse_retry_delay(raw: Optional[str]) -> Optional[float]:
         return None
 
 
-async def _post_gemini(client: httpx.AsyncClient, text: str) -> bytes:
-    """One generateContent call. Returns WAV bytes. Never calls countTokens (it spends the TPM quota)."""
+async def _post_gemini(client: httpx.AsyncClient, text: str, persona: Optional[str] = None) -> bytes:
+    """One generateContent call. Returns WAV bytes. Never calls countTokens (it spends the TPM quota).
+    Body mirrors AI Studio Playground: "## Transcript:" header + speechMetadata.style + prebuilt voice."""
+    p = PERSONA_BY_KEY.get(persona or DEFAULT_PERSONA, PERSONA_BY_KEY[DEFAULT_PERSONA])
+    part: dict[str, Any] = {"text": "## Transcript:\n" + text}
+    if p.style:
+        part["speechMetadata"] = {"style": p.style}
     resp = await client.post(
         GEMINI_URL.format(model=GEMINI_MODEL),
         headers={"x-goog-api-key": GEMINI_API_KEY or ""},
         json={
-            "contents": [{"parts": [{"text": text}]}],
+            "contents": [{"role": "user", "parts": [part]}],
             "generationConfig": {
                 "responseModalities": ["AUDIO"],
-                "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": GEMINI_VOICE}}},
+                "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": p.voice}}},
             },
         },
     )
@@ -468,25 +576,27 @@ def _wav_to_mp3(wav_bytes: bytes) -> bytes:
     return bytes(out)
 
 
-async def _gemini_segments(client: httpx.AsyncClient, text: str, pacer: GeminiPacer) -> tuple[list[bytes], int]:
+async def _gemini_segments(
+    client: httpx.AsyncClient, text: str, pacer: GeminiPacer, persona: Optional[str] = None,
+) -> tuple[list[bytes], int]:
     """Returns MP3 segments. Each WAV is encoded (off the event loop) as soon as it arrives, so
     at most one part's WAV is held in memory at a time."""
     await pacer.wait()
     try:
-        wav = await _post_gemini(client, text)
+        wav = await _post_gemini(client, text, persona=persona)
         requests = 1
     except GeminiQuotaError as exc:
         if exc.kind == "minute":
             # Requests/min or unknown per-minute limit: same size will pass after the delay.
             await pacer._sleep(exc.retry_delay or pacer.min_interval)
-            wav = await _post_gemini(client, text)
+            wav = await _post_gemini(client, text, persona=persona)
             requests = 2
         elif exc.kind == "tokens" and len(text) >= GEMINI_MIN_SPLIT * 2:
             # Counted over the input-token budget: this size can never pass — halve it.
             LOGGER.warning("Gemini input-token quota on %d chars — splitting in half", len(text))
             mp3s, requests = [], 1
             for half in _split_text(text, len(text) // 2):
-                half_mp3s, half_requests = await _gemini_segments(client, half, pacer)
+                half_mp3s, half_requests = await _gemini_segments(client, half, pacer, persona)
                 mp3s += half_mp3s
                 requests += half_requests
             return mp3s, requests
@@ -497,10 +607,10 @@ async def _gemini_segments(client: httpx.AsyncClient, text: str, pacer: GeminiPa
     return [mp3], requests
 
 
-async def _synthesize_gemini_part(text: str, pacer: GeminiPacer) -> tuple[bytes, int]:
+async def _synthesize_gemini_part(text: str, pacer: GeminiPacer, persona: Optional[str] = None) -> tuple[bytes, int]:
     timeout = httpx.Timeout(GEMINI_READ_TIMEOUT, connect=TTS_CONNECT_TIMEOUT)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        mp3s, requests = await _gemini_segments(client, text, pacer)
+        mp3s, requests = await _gemini_segments(client, text, pacer, persona)
     return b"".join(mp3s), requests
 
 
@@ -622,6 +732,7 @@ async def _flush_chat_after_delay(chat_id: int, app: Application) -> None:
         parts=parts,
         queued_at=datetime.now(ZoneInfo(USAGE_TIMEZONE)),
         engine=engine,
+        persona=_resolve_persona(await _get_chat_persona(app, chat_id)),
     ))
 
 
@@ -664,7 +775,7 @@ async def _process_job(app: Application, job: TTSJob) -> None:
         try:
             if engine == "gemini":
                 try:
-                    audio_bytes, requests = await _synthesize_gemini_part(part, GEMINI_PACER)
+                    audio_bytes, requests = await _synthesize_gemini_part(part, GEMINI_PACER, persona=job.persona)
                 except Exception as exc:
                     # Any Gemini failure (daily quota, 5xx, timeout, no audio): the rest of THIS article
                     # goes to Chirp, re-split for Chirp's limits. Told in its own message — a status
@@ -753,13 +864,38 @@ def _is_allowed_chat(chat_id: int) -> bool:
 async def start(update: Update, context):
     if not _is_allowed_chat(update.effective_chat.id):
         return
-    await update.message.reply_text("ส่ง text มา แล้วจะแปลงเป็นเสียงให้ฟัง")
+    await update.message.reply_text("ส่ง text มา แล้วจะแปลงเป็นเสียงให้ฟัง\n/settings เลือกผู้อ่าน")
+
+
+async def settings(update: Update, context):
+    chat_id = update.effective_chat.id
+    if not _is_allowed_chat(chat_id):
+        return
+    current = await _get_chat_persona(context.application, chat_id)
+    await update.message.reply_text("เลือกผู้อ่าน", reply_markup=_settings_keyboard(current))
+
+
+async def on_persona_button(update: Update, context):
+    chat_id = update.effective_chat.id
+    query = update.callback_query
+    if not _is_allowed_chat(chat_id):
+        return
+    key = (query.data or "").removeprefix("persona:")
+    if key not in PERSONA_BY_KEY and key != RANDOM_PERSONA:
+        await query.answer()
+        return
+    await _save_chat_persona(context.application, chat_id, key)
+    await query.answer(f"เลือก {_persona_label(key)} แล้ว")
+    with contextlib.suppress(Exception):
+        await query.edit_message_reply_markup(reply_markup=_settings_keyboard(key))
 
 
 async def status(update: Update, context):
-    if not _is_allowed_chat(update.effective_chat.id):
+    chat_id = update.effective_chat.id
+    if not _is_allowed_chat(chat_id):
         return
-    await update.message.reply_text(_format_runtime_status(USAGE_METER.preview()))
+    reader = _persona_label(await _get_chat_persona(context.application, chat_id))
+    await update.message.reply_text(_format_runtime_status(USAGE_METER.preview()) + f"\nreader: {reader}")
 
 
 async def handle_text(update: Update, context):
@@ -797,6 +933,8 @@ def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("settings", settings))
+    app.add_handler(CallbackQueryHandler(on_persona_button, pattern=r"^persona:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     webhook_url = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEBHOOK_URL")

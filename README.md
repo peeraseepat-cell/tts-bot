@@ -29,7 +29,8 @@ A small, production-minded Telegram bot that turns Thai text into high-quality a
 |---------|--------------|
 | *(send any text)* | Converts it to Thai speech and returns the audio file(s) |
 | `/start` | Quick hint on how to use the bot |
-| `/status` | Shows this month's character usage and remaining quota |
+| `/status` | Shows this month's character usage, remaining quota and the current reader |
+| `/settings` | Pick the Gemini reader (4 personas or 🎲 random). Saved as a pinned message in the chat |
 
 Send a long article and you'll see something like:
 
@@ -74,7 +75,7 @@ All configuration is via environment variables. Only the first two are required.
 | `ALLOWED_CHAT_IDS` | | — (everyone) | Comma-separated chat IDs allowed to use the bot; others are silently ignored. Get yours from [@userinfobot](https://t.me/userinfobot) |
 | `GEMINI_API_KEY` | | — | Google AI Studio key. When set, narration uses Gemini TTS and Chirp becomes the fallback for when the Gemini daily quota runs out |
 | `GEMINI_TTS_MODEL` | | `gemini-3.8-flash-tts` | Gemini TTS model (Thai needs Flash TTS; Flash-Lite TTS has no Thai) |
-| `TTS_VOICE_GEMINI` | | `Aoede` | Gemini prebuilt voice name |
+| `TTS_PERSONA` | | `jan` | Default Gemini reader (`jan` `tom` `leng` `dak`) until `/settings` picks one. The choice is saved in a message the bot pins in the chat, so it survives restarts without a database |
 | `GEMINI_PART_SIZE` | | `14000` | Characters per Gemini request / audio file. The free tier counts ~2× prompt tokens against 10K input tokens/min; 14k Thai chars ≈ 9.2K |
 | `TTS_VOICE` | | `th-TH-Chirp3-HD-Achernar` | Any Google Cloud TTS voice name (Chirp) |
 | `SUPABASE_URL` / `SUPABASE_KEY` | | — | Enables persistent per-user usage metering |
